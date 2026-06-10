@@ -17,6 +17,46 @@
                 unit-jsc14 unit-jsc15 unit-jsc16 unit-jsc17 unit-jsc18
                 unit-jsc19 unit-jsc20 unit-jsc21
                 unit-wasm"
+         ver="1.36.0" rev="1"
+         date="2026-06-10" time="08:00:00 +0000"
+         packager="Nginx Packaging &lt;nginx-packaging@f5.com&gt;">
+
+<change>
+<para>
+NGINX Unit updated to 1.36.0.
+</para>
+</change>
+
+</changes>
+
+
+<changes apply="unit" ver="1.36.0" rev="1"
+         date="2026-06-10" time="08:00:00 +0000"
+         packager="Nginx Packaging &lt;nginx-packaging@f5.com&gt;">
+
+<change type="bugfix">
+<para>
+PHP applications can now read the rewrite result from the UNIT_REWRITTEN_PATH
+server variable while REQUEST_URI continues to contain the original request
+URI. This addresses upstream issue nginx/unit#1615.
+</para>
+</change>
+
+</changes>
+
+
+<changes apply="unit-php
+                unit-python unit-python2.7
+                unit-python3.4 unit-python3.5 unit-python3.6 unit-python3.7
+                unit-python3.8 unit-python3.9 unit-python3.10 unit-python3.11
+                unit-python3.12 unit-python3.13
+                unit-go
+                unit-perl
+                unit-ruby
+                unit-jsc-common unit-jsc8 unit-jsc10 unit-jsc11 unit-jsc13
+                unit-jsc14 unit-jsc15 unit-jsc16 unit-jsc17 unit-jsc18
+                unit-jsc19 unit-jsc20 unit-jsc21
+                unit-wasm"
          ver="1.35.0" rev="1"
          date="2025-09-03" time="18:00:00 +0000"
          packager="Nginx Packaging &lt;nginx-packaging@f5.com&gt;">

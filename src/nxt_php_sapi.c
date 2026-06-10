@@ -1495,6 +1495,9 @@ nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
     nxt_php_set_str(req, "DOCUMENT_ROOT", ctx->root,
                     track_vars_array TSRMLS_CC);
 
+    nxt_php_set_sptr(req, "UNIT_REWRITTEN_PATH", &r->path, r->path_length,
+                     track_vars_array TSRMLS_CC);
+
     nxt_php_set_sptr(req, "REQUEST_METHOD", &r->method, r->method_length,
                      track_vars_array TSRMLS_CC);
     nxt_php_set_sptr(req, "REQUEST_URI", &r->target, r->target_length,

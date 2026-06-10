@@ -158,9 +158,12 @@ def test_php_application_query_string():
 
     resp = client.get(url='/?var1=val1&var2=val2')
 
+    assert resp['status'] == 200, 'query string status'
     assert (
         resp['headers']['Query-String'] == 'var1=val1&var2=val2'
     ), 'query string'
+    assert resp['headers']['Request-Uri'] == '/?var1=val1&var2=val2'
+    assert resp['headers']['Unit-Rewritten-Path'] == '/'
 
 
 def test_php_application_query_string_empty():
@@ -200,6 +203,8 @@ def test_php_application_query_string_rewrite():
     resp = client.get(url='/old?arg=val')
     assert resp['status'] == 200
     assert resp['headers']['Query-String'] == 'arg=val'
+    assert resp['headers']['Request-Uri'] == '/old?arg=val'
+    assert resp['headers']['Unit-Rewritten-Path'] == '/new'
 
 
 def test_php_application_fastcgi_finish_request(findall, unit_pid):

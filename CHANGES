@@ -1,4 +1,12 @@
 
+Changes with Unit 1.36.0                                         10 Jun 2026
+
+    *) Bugfix: PHP applications can now read the rewrite result from the
+       UNIT_REWRITTEN_PATH server variable while REQUEST_URI continues to
+       contain the original request URI. This addresses upstream issue
+       nginx/unit#1615.
+
+
 Changes with Unit 1.35.0                                         03 Sep 2025
 
     *) Security: fix missing websocket payload length validation in the Java
@@ -1225,4 +1233,3 @@ Changes with Unit 0.2                                            19 Oct 2017
 Changes with Unit 0.1                                            06 Sep 2017
 
     *) First public release.
-
