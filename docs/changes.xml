@@ -19,6 +19,14 @@ patch first shipped in ndj888/unit 1.36.0.
 </para>
 </change>
 
+<change type="bugfix">
+<para>
+on macOS with 16 KiB pages, every request to an application failed with
+"incoming_mmap: unexpected segment size". Backported to ndj888/unit 1.37.0
+from FreeUnit master (aae35c6f, freeunitorg/freeunit#595).
+</para>
+</change>
+
 <change type="change">
 <para>
 on Linux, the default number of router threads ("listen_threads") is now at

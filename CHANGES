@@ -6,6 +6,14 @@ Changes with FreeUnit 1.37.0                                     04 Oct 2026
        original request URI. This addresses nginx/unit#1615. This
        fork-specific patch first shipped in ndj888/unit 1.36.0.
 
+    *) Bugfix: on macOS with 16 KiB pages, every request to an application
+       failed. The application logged "incoming_mmap: unexpected segment
+       size: 10502144 != 10489856" and exited. macOS rounds a shared memory
+       segment up to a whole page, and 1.37.0 required the exact size. A
+       larger segment is now accepted. A shorter one is still refused.
+       Backported to ndj888/unit 1.37.0 from FreeUnit master (aae35c6f,
+       freeunitorg/freeunit#595).
+
     *) Bugfix: a chunked request body that grew over "max_body_size"
        after the read that carried the request header got no response.
        The router closed the connection without a status line. Now it
