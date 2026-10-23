@@ -325,69 +325,105 @@ nxt_file_set_access(nxt_file_name_t *name, nxt_file_access_t access)
 }
 
 
-nxt_int_t
-nxt_file_chown(nxt_file_name_t *name, const char *owner, const char *group)
-{
-    int    err;
-    char   *buf;
-    long   bufsize;
-    gid_t  gid = ~0;
-    uid_t  uid = ~0;
+/*
+ * Resolves the user and group names with the reentrant calls.  An id stays
+ * -1 when its name is NULL.  The buffer grows on ERANGE, up to 1M.
+ */
 
-    if (owner == NULL && group == NULL) {
-        return NXT_OK;
-    }
+#define NXT_FILE_OWNER_BUF_MAX  (1024 * 1024)
+
+
+nxt_int_t
+nxt_file_owner_ids(const char *owner, const char *group, uid_t *uid,
+    gid_t *gid)
+{
+    int            err;
+    long           size;
+    char           *buf;
+    struct group   grp, *gr;
+    struct passwd  pwd, *pw;
+
+    *uid = (uid_t) -1;
+    *gid = (gid_t) -1;
 
     if (owner != NULL) {
-        struct passwd  pwd, *result;
-
-        bufsize = sysconf(_SC_GETPW_R_SIZE_MAX);
-        if (bufsize == -1) {
-            bufsize = 32768;
+        /* sysconf() returns -1 when the system has no limit. */
+        size = sysconf(_SC_GETPW_R_SIZE_MAX);
+        if (size <= 0) {
+            size = 16384;
         }
 
-        buf = nxt_malloc(bufsize);
-        if (buf == NULL) {
+        for ( ;; ) {
+            buf = nxt_malloc(size);
+            if (buf == NULL) {
+                return NXT_ERROR;
+            }
+
+            err = getpwnam_r(owner, &pwd, buf, size, &pw);
+            if (err != ERANGE || size >= NXT_FILE_OWNER_BUF_MAX) {
+                break;
+            }
+
+            nxt_free(buf);
+            size *= 2;
+        }
+
+        if (pw == NULL) {
+            nxt_thread_log_alert("getpwnam_r(\"%s\", ...) failed %E %s",
+                                 owner, err,
+                                 err == 0 ? "(User not found)" : "");
+            nxt_free(buf);
             return NXT_ERROR;
         }
 
-        err = getpwnam_r(owner, &pwd, buf, bufsize, &result);
-        if (result == NULL) {
-            nxt_thread_log_alert("getpwnam_r(\"%s\", ...) failed %E %s",
-                                 owner, nxt_errno,
-                                 err == 0 ? "(User not found)" : "");
-            goto out_err_free;
-        }
-
-        uid = pwd.pw_uid;
+        *uid = pwd.pw_uid;
 
         nxt_free(buf);
     }
 
     if (group != NULL) {
-        struct group  grp, *result;
-
-        bufsize = sysconf(_SC_GETGR_R_SIZE_MAX);
-        if (bufsize == -1) {
-            bufsize = 32768;
+        size = sysconf(_SC_GETGR_R_SIZE_MAX);
+        if (size <= 0) {
+            size = 16384;
         }
 
-        buf = nxt_malloc(bufsize);
-        if (buf == NULL) {
+        for ( ;; ) {
+            buf = nxt_malloc(size);
+            if (buf == NULL) {
+                return NXT_ERROR;
+            }
+
+            err = getgrnam_r(group, &grp, buf, size, &gr);
+            if (err != ERANGE || size >= NXT_FILE_OWNER_BUF_MAX) {
+                break;
+            }
+
+            nxt_free(buf);
+            size *= 2;
+        }
+
+        if (gr == NULL) {
+            nxt_thread_log_alert("getgrnam_r(\"%s\", ...) failed %E %s",
+                                 group, err,
+                                 err == 0 ? "(Group not found)" : "");
+            nxt_free(buf);
             return NXT_ERROR;
         }
 
-        err = getgrnam_r(group, &grp, buf, bufsize, &result);
-        if (result == NULL) {
-            nxt_thread_log_alert("getgrnam_r(\"%s\", ...) failed %E %s",
-                                 group, nxt_errno,
-                                 err == 0 ? "(Group not found)" : "");
-            goto out_err_free;
-        }
-
-        gid = grp.gr_gid;
+        *gid = grp.gr_gid;
 
         nxt_free(buf);
+    }
+
+    return NXT_OK;
+}
+
+
+nxt_int_t
+nxt_file_chown(nxt_file_name_t *name, uid_t uid, gid_t gid)
+{
+    if (uid == (uid_t) -1 && gid == (gid_t) -1) {
+        return NXT_OK;
     }
 
     if (nxt_fast_path(chown((const char *) name, uid, gid) == 0)) {
@@ -395,13 +431,8 @@ nxt_file_chown(nxt_file_name_t *name, const char *owner, const char *group)
     }
 
     nxt_thread_log_alert("chown(\"%FN\", %l, %l) failed %E", name,
-                         owner != NULL ? (long) uid : -1,
-                         group != NULL ? (long) gid : -1, nxt_errno);
-
-    return NXT_ERROR;
-
-out_err_free:
-    nxt_free(buf);
+                         uid != (uid_t) -1 ? (long) uid : -1,
+                         gid != (gid_t) -1 ? (long) gid : -1, nxt_errno);
 
     return NXT_ERROR;
 }
@@ -423,6 +454,152 @@ nxt_file_rename(nxt_file_name_t *old_name, nxt_file_name_t *new_name)
                          old_name, new_name, nxt_errno);
 
     return NXT_ERROR;
+}
+
+
+/*
+ * The errors of a file system that cannot flush a descriptor in the asked
+ * way.  ENOTSUP and EOPNOTSUPP are one value on Linux and FreeBSD, and two
+ * values on macOS.
+ */
+static nxt_bool_t
+nxt_file_sync_unsupported(nxt_err_t err)
+{
+    switch (err) {
+
+    case NXT_EINVAL:
+    case NXT_EOPNOTSUPP:
+#if (ENOTSUP != EOPNOTSUPP)
+    case ENOTSUP:
+#endif
+    case ENOTTY:
+        return 1;
+
+    default:
+        return 0;
+    }
+}
+
+
+#if defined(F_FULLFSYNC)
+
+/*
+ * Runs a macOS flush command.  EINTR repeats the call.  If the file system
+ * does not support the command, for example an SMB mount with ENOTSUP,
+ * fsync() does the flush and its result counts.  Any other error, such as
+ * EIO, is the result: the flush failed.
+ */
+static int
+nxt_file_fcntl_sync(nxt_fd_t fd, int cmd)
+{
+    nxt_err_t  err;
+
+    for ( ;; ) {
+        if (fcntl(fd, cmd) == 0) {
+            return 0;
+        }
+
+        err = nxt_errno;
+
+        if (err != NXT_EINTR) {
+            break;
+        }
+    }
+
+    if (nxt_file_sync_unsupported(err)) {
+        return fsync(fd);
+    }
+
+    /* errno still holds the error of fcntl(). */
+    return -1;
+}
+
+#endif
+
+
+/*
+ * On macOS, fsync(2) sends the data to the drive, but the drive can keep it
+ * in its cache, so a power loss can still lose it.  F_FULLFSYNC also
+ * flushes the cache of the drive, and it waits for the whole queue of the
+ * device.  F_BARRIERFSYNC only orders the data before any later write to
+ * the device.  So a file gets the barrier, and the directory gets the full
+ * flush after the rename.  That one full flush makes the data and the
+ * rename durable.  Without barrier support fsync() takes the place of the
+ * barrier, and only the later full flush orders the data, as before.
+ * Elsewhere both are fsync().
+ */
+static int
+nxt_file_fsync(nxt_fd_t fd, nxt_bool_t full)
+{
+#if defined(F_FULLFSYNC)
+#if defined(F_BARRIERFSYNC)
+    if (!full) {
+        return nxt_file_fcntl_sync(fd, F_BARRIERFSYNC);
+    }
+#endif
+    return nxt_file_fcntl_sync(fd, F_FULLFSYNC);
+#else
+    return fsync(fd);
+#endif
+}
+
+
+nxt_int_t
+nxt_file_sync(nxt_task_t *task, nxt_file_t *file)
+{
+    nxt_debug(task, "fsync(%FD, \"%FN\")", file->fd, file->name);
+
+    if (nxt_fast_path(nxt_file_fsync(file->fd, 0) == 0)) {
+        return NXT_OK;
+    }
+
+    file->error = nxt_errno;
+
+    nxt_alert(task, "fsync(%FD, \"%FN\") failed %E",
+              file->fd, file->name, file->error);
+
+    return NXT_ERROR;
+}
+
+
+nxt_int_t
+nxt_file_dir_sync(nxt_task_t *task, nxt_file_name_t *name)
+{
+    int        fd;
+    nxt_int_t  ret;
+    nxt_err_t  err;
+
+    fd = open((char *) name, O_RDONLY | NXT_FILE_DIR_SYNC_FLAGS);
+    if (nxt_slow_path(fd == -1)) {
+        nxt_alert(task, "open(\"%FN\", O_RDONLY) failed %E", name, nxt_errno);
+        return NXT_ERROR;
+    }
+
+    nxt_debug(task, "fsync(%FD, \"%FN\") directory", fd, name);
+
+    ret = NXT_OK;
+
+    if (nxt_slow_path(nxt_file_fsync(fd, 1) != 0)) {
+        err = nxt_errno;
+
+        /*
+         * Some file systems refuse to flush a directory descriptor at all;
+         * the rename() has still happened, so this is not a store failure.
+         */
+        if (nxt_file_sync_unsupported(err)) {
+            nxt_debug(task, "fsync(%FD, \"%FN\") directory unsupported %E",
+                      fd, name, err);
+
+        } else {
+            nxt_alert(task, "fsync(%FD, \"%FN\") directory failed %E",
+                      fd, name, err);
+            ret = NXT_ERROR;
+        }
+    }
+
+    nxt_fd_close(fd);
+
+    return ret;
 }
 
 
@@ -621,7 +798,8 @@ nxt_file_fclose(nxt_task_t *task, FILE *fp)
 
 /*
  * nxt_file_redirect() redirects the file to the fd descriptor.
- * Then the fd descriptor is closed.
+ * Then the fd descriptor is closed -- on the failing paths as well, so that
+ * the caller can hand the descriptor over unconditionally.
  */
 
 nxt_int_t
@@ -632,6 +810,14 @@ nxt_file_redirect(nxt_file_t *file, nxt_fd_t fd)
     if (dup2(fd, file->fd) == -1) {
         nxt_thread_log_alert("dup2(%FD, %FD, \"%FN\") failed %E",
                              fd, file->fd, file->name, nxt_errno);
+
+        /*
+         * The descriptor is consumed whatever the outcome, as the comment
+         * above states: callers hand it over and never close it on success,
+         * so failing without closing it here leaked it instead.
+         */
+        (void) close(fd);
+
         return NXT_ERROR;
     }
 
@@ -725,22 +911,58 @@ nxt_int_t
 nxt_pipe_create(nxt_task_t *task, nxt_fd_t *pp, nxt_bool_t nbread,
     nxt_bool_t nbwrite)
 {
+#if (NXT_HAVE_PIPE2)
+    if (pipe2(pp, O_CLOEXEC) == 0) {
+        goto created;
+    }
+
+    /*
+     * pipe2() is probed at compile time only, so a binary built where the
+     * headers advertise it can still run on an older kernel/libc that
+     * returns ENOSYS.  Fall back to pipe() + FD_CLOEXEC in that case
+     * instead of failing every pipe creation.
+     */
+    if (nxt_errno != NXT_ENOSYS) {
+        nxt_alert(task, "pipe2() failed %E", nxt_errno);
+
+        return NXT_ERROR;
+    }
+#endif
+
     if (pipe(pp) != 0) {
         nxt_alert(task, "pipe() failed %E", nxt_errno);
 
         return NXT_ERROR;
     }
 
+    /*
+     * Set FD_CLOEXEC on both ends so that pipe fds do not leak across
+     * exec() into spawned application processes.
+     */
+    if (fcntl(pp[0], F_SETFD, FD_CLOEXEC) == -1
+        || fcntl(pp[1], F_SETFD, FD_CLOEXEC) == -1)
+    {
+        nxt_alert(task, "fcntl(F_SETFD, FD_CLOEXEC) failed %E", nxt_errno);
+        nxt_pipe_close(task, pp);
+        return NXT_ERROR;
+    }
+
+#if (NXT_HAVE_PIPE2)
+created:
+#endif
+
     nxt_debug(task, "pipe(): %FD:%FD", pp[0], pp[1]);
 
     if (nbread) {
         if (nxt_fd_nonblocking(task, pp[0]) != NXT_OK) {
+            nxt_pipe_close(task, pp);
             return NXT_ERROR;
         }
     }
 
     if (nbwrite) {
         if (nxt_fd_nonblocking(task, pp[1]) != NXT_OK) {
+            nxt_pipe_close(task, pp);
             return NXT_ERROR;
         }
     }

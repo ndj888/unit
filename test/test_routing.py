@@ -297,6 +297,75 @@ def test_routes_bad_regex(require):
         assert client.get(url='/nothing_z')['status'] == 500, '/nothing_z'
 
 
+def test_routes_regex_match_limit(require, wait_for_record, findall):
+    require({'modules': {'regex': True}})
+
+    # PCRE2 10.4x and PCRE 8.x try each split of the commas between the two
+    # groups, about 2M steps.  They do not see that no "x" or "y" is in the
+    # subject.
+    route_match({"headers": {"x-blah": "~^(.*),(.*)[xy]$"}})
+
+    assert (
+        client.get(headers={'Host': 'localhost', 'X-Blah': ',' * 2000,
+                            'Connection': 'close'})['status']
+        == 500
+    ), 'match limit'
+
+    assert (
+        wait_for_record(r'\[warn\].+reached the match limit on 2000 bytes')
+        is not None
+    ), 'match limit log'
+    assert not findall(r',{64}'), 'no subject in the log'
+
+    assert (
+        client.get(headers={'Host': 'localhost', 'X-Blah': 'a,bx',
+                            'Connection': 'close'})['status']
+        == 200
+    ), 'short subject'
+
+
+def test_routes_regex_match_limit_unanchored(require, wait_for_record):
+    require({'modules': {'regex': True}})
+
+    # The library counts the steps from zero again at each start position.
+    # This pattern takes about 8,000 steps at each of the first 976
+    # positions, below the limit at each one.  The limit must stop the
+    # whole match.
+    route_match({"headers": {"x-blah": "~(?=a)(?:a|aa){0,12}[xy]"}})
+
+    assert (
+        client.get(headers={'Host': 'localhost', 'X-Blah': 'a' * 1000 + 'x',
+                            'Connection': 'close'})['status']
+        == 500
+    ), 'match limit'
+
+    assert (
+        wait_for_record(r'\[warn\].+reached the match limit on 1001 bytes')
+        is not None
+    ), 'match limit log'
+
+    assert (
+        client.get(headers={'Host': 'localhost', 'X-Blah': 'aax',
+                            'Connection': 'close'})['status']
+        == 200
+    ), 'short subject'
+
+
+def test_routes_match_regex_captures(require):
+    require({'modules': {'regex': True}})
+
+    # Capturing groups exercise the PCRE2 match ovector; the matcher
+    # must pass a non-zero ovector size (a zero size is undefined per
+    # PCRE2) and still return a correct boolean match.
+    route_match({"uri": "~^/(foo|bar)/([0-9]+)$"})
+
+    assert client.get(url='/foo/123')['status'] == 200, 'capture foo'
+    assert client.get(url='/bar/9')['status'] == 200, 'capture bar'
+    assert client.get(url='/baz/1')['status'] == 404, 'capture miss'
+    assert client.get(url='/foo/x')['status'] == 404, 'capture non-digit'
+    assert client.get(url='/foo/')['status'] == 404, 'capture empty'
+
+
 def test_routes_match_regex_case_sensitive(require):
     require({'modules': {'regex': True}})
 
@@ -699,6 +768,20 @@ def test_routes_match_uri_normalize():
     route_match({"uri": "/blah"})
 
     assert client.get(url='/%62%6c%61%68')['status'] == 200, 'normalize'
+
+
+def test_routes_match_uri_encoded_pattern():
+    # The configured pattern is percent-decoded at compile time the same
+    # way the request URI is decoded by the parser, so an encoded pattern
+    # must match the equivalent plain-text request and vice versa.
+    route_match({"uri": "/%62lah"})
+    assert client.get(url='/blah')['status'] == 200, 'encoded pattern exact'
+    assert client.get(url='/%62lah')['status'] == 200, 'encoded pattern encoded'
+    assert client.get(url='/xlah')['status'] == 404, 'encoded pattern miss'
+
+    route_match({"uri": "/%62*"})
+    assert client.get(url='/blah')['status'] == 200, 'encoded prefix'
+    assert client.get(url='/xlah')['status'] == 404, 'encoded prefix miss'
 
 
 def test_routes_match_empty_array():
@@ -1923,6 +2006,21 @@ def test_routes_match_source_invalid():
     route_match_invalid({"source": "*:"})
     route_match_invalid({"source": "*:1-a"})
     route_match_invalid({"source": "*:65536"})
+
+
+def test_routes_match_source_port_range_invalid():
+    # A dash at either end of a port range leaves an empty half that
+    # nxt_int_parse() must reject.  The pre-hardening parser silently
+    # accepted a trailing dash ("8-" was read as the single port 8),
+    # so these malformed ranges are explicit regression guards.
+    route_match_invalid({"source": "127.0.0.1:8-"})
+    route_match_invalid({"source": "127.0.0.1:-8"})
+    route_match_invalid({"source": "127.0.0.1:-"})
+    route_match_invalid({"source": "*:8-"})
+    route_match_invalid({"source": "*:-8"})
+    route_match_invalid({"source": "*:-"})
+    route_match_invalid({"source": "[::1]:8-"})
+    route_match_invalid({"source": "[::1]:-8"})
 
 
 def test_routes_match_source_none():

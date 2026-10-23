@@ -98,19 +98,17 @@ extern const nxt_tls_lib_t        nxt_openssl_lib;
 void nxt_cdecl nxt_openssl_log_error(nxt_task_t *task, nxt_uint_t level,
     const char *fmt, ...);
 u_char *nxt_openssl_copy_error(u_char *p, u_char *end);
-#endif
 
-#if (NXT_HAVE_GNUTLS)
-extern const nxt_tls_lib_t        nxt_gnutls_lib;
-#endif
+#if (NXT_TESTS)
+/*
+ * Makes nxt_openssl_server_init() take one of its failure paths, for
+ * src/test/nxt_openssl_server_init_test.c.
+ */
+#define NXT_OPENSSL_TEST_FAIL_CTX_NEW  1
+#define NXT_OPENSSL_TEST_FAIL_BIO_NEW  2
 
-#if (NXT_HAVE_CYASSL)
-extern const nxt_tls_lib_t        nxt_cyassl_lib;
+NXT_EXPORT extern nxt_uint_t  nxt_openssl_test_fail;
 #endif
-
-#if (NXT_HAVE_POLARSSL)
-extern const nxt_tls_lib_t        nxt_polar_lib;
 #endif
-
 
 #endif /* _NXT_TLS_H_INCLUDED_ */

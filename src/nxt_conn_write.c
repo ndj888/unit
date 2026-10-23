@@ -27,6 +27,14 @@ nxt_conn_io_write(nxt_task_t *task, void *obj, void *data)
     nxt_debug(task, "conn write fd:%d er:%d bl:%d",
               c->socket.fd, c->socket.error, c->block_write);
 
+    /*
+     * A write queued before nxt_conn_close() returns here: the error path
+     * would queue the close state's NULL error_handler.
+     */
+    if (c->closing) {
+        return;
+    }
+
     if (c->socket.error != 0 || c->block_write) {
         goto error;
     }
@@ -118,12 +126,8 @@ nxt_conn_io_write(nxt_task_t *task, void *obj, void *data)
         }
     }
 
-    if (ret == 0 || sb.sent != 0) {
-        /*
-         * ret == 0 means a sync buffer was processed.
-         * ret == NXT_ERROR is ignored here if some data was sent,
-         * the error will be handled on the next nxt_conn_write() call.
-         */
+    if (ret == 0 || (ret != NXT_ERROR && sb.sent != 0)) {
+        /* ret == 0 means a sync buffer was processed. */
         c->sent += sb.sent;
         nxt_work_queue_add(c->write_work_queue, c->write_state->ready_handler,
                            task, c, data);
@@ -132,6 +136,21 @@ nxt_conn_io_write(nxt_task_t *task, void *obj, void *data)
 
     if (ret != NXT_ERROR) {
         return;
+    }
+
+    if (sb.sent != 0) {
+        /*
+         * Route to error_handler immediately when a write returns
+         * NXT_ERROR after a partial send (e.g. peer closed
+         * mid-response).  Previously this case fell through to
+         * ready_handler and the error was deferred to the next
+         * nxt_conn_io_write() call via c->socket.error.  Mirrors the
+         * TLS path's fail-fast behaviour; see nxt_openssl_conn_test_error.
+         */
+        c->sent += sb.sent;
+        nxt_log(task, NXT_LOG_INFO,
+                "conn write: peer closed mid-response fd:%d sent:%O",
+                c->socket.fd, sb.sent);
     }
 
     nxt_fd_event_block_write(engine, &c->socket);

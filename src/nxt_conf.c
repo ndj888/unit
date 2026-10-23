@@ -103,6 +103,23 @@ typedef struct {
 static nxt_int_t nxt_conf_path_next_token(nxt_conf_path_parse_t *parse,
     nxt_str_t *token);
 
+/*
+ * Hard caps on JSON inputs to the controller.  Both values are
+ * intentionally well above any legitimate Unit config (configs rarely
+ * nest more than 6 levels; the largest production configs we've seen
+ * have a few thousand elements per array).  These exist to bound the
+ * controller's stack and heap usage on malformed input.
+ */
+#define NXT_CONF_JSON_MAX_DEPTH     100
+#define NXT_CONF_JSON_MAX_ELEMENTS  100000
+
+/*
+ * Recursion-depth counter.  The controller is single-threaded so a
+ * file-static suffices.  Reset on every entry to nxt_conf_json_parse()
+ * so a stale value from an aborted prior call cannot leak.
+ */
+static nxt_uint_t  nxt_conf_json_parse_depth;
+
 static u_char *nxt_conf_json_skip_space(u_char *start, const u_char *end);
 static u_char *nxt_conf_json_parse_value(nxt_mp_t *mp, nxt_conf_value_t *value,
     u_char *start, u_char *end, nxt_conf_json_error_t *error);
@@ -590,10 +607,15 @@ nxt_conf_map_object(nxt_mp_t *mp, const nxt_conf_value_t *value,
     const nxt_conf_map_t *map, nxt_uint_t n, void *data)
 {
     double            num;
+    size_t            len;
     nxt_str_t         str, *s;
     nxt_uint_t        i;
     nxt_conf_value_t  *v;
 
+    /*
+     * A mapped field can have less alignment than its type needs.
+     * Build the value here and copy it to the field with nxt_memcpy().
+     */
     union {
         uint8_t     ui8;
         int32_t     i32;
@@ -606,7 +628,7 @@ nxt_conf_map_object(nxt_mp_t *mp, const nxt_conf_value_t *value,
         nxt_str_t   str;
         char        *cstrz;
         void        *v;
-    } *ptr;
+    } val;
 
     for (i = 0; i < n; i++) {
 
@@ -616,16 +638,16 @@ nxt_conf_map_object(nxt_mp_t *mp, const nxt_conf_value_t *value,
             continue;
         }
 
-        ptr = nxt_pointer_to(data, map[i].offset);
-
         switch (map[i].type) {
 
         case NXT_CONF_MAP_INT8:
 
-            if (v->type == NXT_CONF_VALUE_BOOLEAN) {
-                ptr->ui8 = v->u.boolean;
+            if (v->type != NXT_CONF_VALUE_BOOLEAN) {
+                continue;
             }
 
+            val.ui8 = v->u.boolean;
+            len = sizeof(val.ui8);
             break;
 
         case NXT_CONF_MAP_INT32:
@@ -636,7 +658,7 @@ nxt_conf_map_object(nxt_mp_t *mp, const nxt_conf_value_t *value,
         case NXT_CONF_MAP_MSEC:
 
             if (v->type != NXT_CONF_VALUE_INTEGER) {
-                break;
+                continue;
             }
 
             num = nxt_strtod(v->u.number, NULL);
@@ -644,41 +666,50 @@ nxt_conf_map_object(nxt_mp_t *mp, const nxt_conf_value_t *value,
             switch (map[i].type) {
 
             case NXT_CONF_MAP_INT32:
-                ptr->i32 = num;
+                val.i32 = num;
+                len = sizeof(val.i32);
                 break;
 
             case NXT_CONF_MAP_INT64:
-                ptr->i64 = num;
+                val.i64 = num;
+                len = sizeof(val.i64);
                 break;
 
             case NXT_CONF_MAP_INT:
-                ptr->i = num;
+                val.i = num;
+                len = sizeof(val.i);
                 break;
 
             case NXT_CONF_MAP_SIZE:
-                ptr->size = num;
+                val.size = num;
+                len = sizeof(val.size);
                 break;
 
             case NXT_CONF_MAP_OFF:
-                ptr->off = num;
+                val.off = num;
+                len = sizeof(val.off);
                 break;
 
             case NXT_CONF_MAP_MSEC:
-                ptr->msec = (nxt_msec_t) num * 1000;
+                val.msec = (nxt_msec_t) num * 1000;
+                len = sizeof(val.msec);
                 break;
 
             default:
                 nxt_unreachable();
+                continue;
             }
 
             break;
 
         case NXT_CONF_MAP_DOUBLE:
 
-            if (v->type == NXT_CONF_VALUE_NUMBER) {
-                ptr->dbl = nxt_strtod(v->u.number, NULL);
+            if (v->type != NXT_CONF_VALUE_NUMBER) {
+                continue;
             }
 
+            val.dbl = nxt_strtod(v->u.number, NULL);
+            len = sizeof(val.dbl);
             break;
 
         case NXT_CONF_MAP_STR:
@@ -688,7 +719,7 @@ nxt_conf_map_object(nxt_mp_t *mp, const nxt_conf_value_t *value,
             if (v->type != NXT_CONF_VALUE_SHORT_STRING
                 && v->type != NXT_CONF_VALUE_STRING)
             {
-                break;
+                continue;
             }
 
             nxt_conf_get_string(v, &str);
@@ -696,41 +727,49 @@ nxt_conf_map_object(nxt_mp_t *mp, const nxt_conf_value_t *value,
             switch (map[i].type) {
 
             case NXT_CONF_MAP_STR:
-                ptr->str = str;
+                val.str = str;
+                len = sizeof(val.str);
                 break;
 
             case NXT_CONF_MAP_STR_COPY:
 
-                s = nxt_str_dup(mp, &ptr->str, &str);
+                s = nxt_str_dup(mp, &val.str, &str);
 
                 if (nxt_slow_path(s == NULL)) {
                     return NXT_ERROR;
                 }
 
+                len = sizeof(val.str);
                 break;
 
             case NXT_CONF_MAP_CSTRZ:
 
-                ptr->cstrz = nxt_str_cstrz(mp, &str);
+                val.cstrz = nxt_str_cstrz(mp, &str);
 
-                if (nxt_slow_path(ptr->cstrz == NULL)) {
+                if (nxt_slow_path(val.cstrz == NULL)) {
                     return NXT_ERROR;
                 }
 
+                len = sizeof(val.cstrz);
                 break;
 
             default:
                 nxt_unreachable();
+                continue;
             }
 
             break;
 
         case NXT_CONF_MAP_PTR:
-
-            ptr->v = v;
-
+            val.v = v;
+            len = sizeof(val.v);
             break;
+
+        default:
+            continue;
         }
+
+        nxt_memcpy(nxt_pointer_to(data, map[i].offset), &val, len);
     }
 
     return NXT_OK;
@@ -1277,6 +1316,8 @@ nxt_conf_json_parse(nxt_mp_t *mp, u_char *start, u_char *end,
         return NULL;
     }
 
+    nxt_conf_json_parse_depth = 0;
+
     p = nxt_conf_json_parse_value(mp, value, p, end, error);
 
     if (nxt_slow_path(p == NULL)) {
@@ -1393,10 +1434,34 @@ nxt_conf_json_parse_value(nxt_mp_t *mp, nxt_conf_value_t *value, u_char *start,
 
     switch (ch) {
     case '{':
-        return nxt_conf_json_parse_object(mp, value, start, end, error);
+        /*
+         * Bound recursion depth so a deeply-nested payload such as
+         * "[[[[...]]]]" cannot blow the controller's stack.  Only
+         * '{' and '[' deepen the recursion; leaf cases below don't
+         * need to touch the counter.
+         */
+        if (nxt_slow_path(nxt_conf_json_parse_depth
+                          >= NXT_CONF_JSON_MAX_DEPTH)) {
+            nxt_conf_json_parse_error(error, start,
+                "JSON nesting exceeds the maximum supported depth.");
+            return NULL;
+        }
+        nxt_conf_json_parse_depth++;
+        p = nxt_conf_json_parse_object(mp, value, start, end, error);
+        nxt_conf_json_parse_depth--;
+        return p;
 
     case '[':
-        return nxt_conf_json_parse_array(mp, value, start, end, error);
+        if (nxt_slow_path(nxt_conf_json_parse_depth
+                          >= NXT_CONF_JSON_MAX_DEPTH)) {
+            nxt_conf_json_parse_error(error, start,
+                "JSON nesting exceeds the maximum supported depth.");
+            return NULL;
+        }
+        nxt_conf_json_parse_depth++;
+        p = nxt_conf_json_parse_array(mp, value, start, end, error);
+        nxt_conf_json_parse_depth--;
+        return p;
 
     case '"':
         return nxt_conf_json_parse_string(mp, value, start, end, error);
@@ -1544,6 +1609,12 @@ nxt_conf_json_parse_object(nxt_mp_t *mp, nxt_conf_value_t *value, u_char *start,
         }
 
         name = p;
+
+        if (nxt_slow_path(count >= NXT_CONF_JSON_MAX_ELEMENTS)) {
+            nxt_conf_json_parse_error(error, p,
+                "JSON object has too many members.");
+            goto error;
+        }
 
         count++;
 
@@ -1759,6 +1830,12 @@ nxt_conf_json_parse_array(nxt_mp_t *mp, nxt_conf_value_t *value, u_char *start,
 
         if (*p == ']') {
             break;
+        }
+
+        if (nxt_slow_path(count >= NXT_CONF_JSON_MAX_ELEMENTS)) {
+            nxt_conf_json_parse_error(error, p,
+                "JSON array has too many elements.");
+            goto error;
         }
 
         count++;

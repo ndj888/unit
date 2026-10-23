@@ -11,6 +11,8 @@ NXT_LD_OPT=
 
 NXT_DEBUG=NO
 
+NXT_HARDENING=off
+
 NXT_INET6=YES
 NXT_UNIX_DOMAIN=YES
 
@@ -22,9 +24,6 @@ NXT_TRY_PCRE2=YES
 
 NXT_TLS=NO
 NXT_OPENSSL=NO
-NXT_GNUTLS=NO
-NXT_CYASSL=NO
-NXT_POLARSSL=NO
 
 NXT_ZLIB=NO
 NXT_ZSTD=NO
@@ -105,6 +104,8 @@ do
 
         --debug)                         NXT_DEBUG=YES                       ;;
 
+        --hardening=*)                   NXT_HARDENING="$value"              ;;
+
         --no-ipv6)                       NXT_INET6=NO                        ;;
         --no-unix-sockets)               NXT_UNIX_DOMAIN=NO                  ;;
 
@@ -112,9 +113,6 @@ do
         --no-pcre2)                      NXT_TRY_PCRE2=NO                    ;;
 
         --openssl)                       NXT_OPENSSL=YES                     ;;
-        --gnutls)                        NXT_GNUTLS=YES                      ;;
-        --cyassl)                        NXT_CYASSL=YES                      ;;
-        --polarssl)                      NXT_POLARSSL=YES                    ;;
 
         --zlib)                          NXT_ZLIB=YES                        ;;
         --zstd)                          NXT_ZSTD=YES                        ;;

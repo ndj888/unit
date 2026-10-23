@@ -73,6 +73,7 @@ struct nxt_http_comp_operations_s {
     ssize_t  (*deflate)(nxt_http_comp_compressor_ctx_t *ctx,
                         const uint8_t *in_buf, size_t in_len,
                         uint8_t *out_buf, size_t out_len, bool last);
+    void     (*free)(nxt_http_comp_compressor_ctx_t *ctx);
 };
 
 
@@ -95,9 +96,12 @@ extern nxt_int_t nxt_http_comp_compress_app_response(nxt_task_t *task,
 extern nxt_int_t nxt_http_comp_compress_static_response(nxt_task_t *task,
     nxt_http_request_t *r, nxt_file_t **f, nxt_file_info_t *fi,
     size_t static_buf_len, size_t *out_total);
-extern bool nxt_http_comp_wants_compression(void);
+extern bool nxt_http_comp_wants_compression(nxt_http_request_t *r);
+extern bool nxt_http_comp_identity_refused(nxt_http_request_t *r);
 extern bool nxt_http_comp_compressor_is_valid(const nxt_str_t *token);
-extern nxt_int_t nxt_http_comp_check_compression(nxt_task_t *task,
+extern nxt_int_t nxt_http_comp_check_acceptable(nxt_task_t *task,
+    nxt_http_request_t *r);
+extern nxt_int_t nxt_http_comp_apply_compression(nxt_task_t *task,
     nxt_http_request_t *r);
 extern nxt_int_t nxt_http_comp_compression_init(nxt_task_t *task,
     nxt_router_conf_t *rtcf, const nxt_conf_value_t *comp_conf);

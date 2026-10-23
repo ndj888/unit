@@ -23,12 +23,9 @@ NXT_LIB_SRCS=" \
     src/nxt_port_memory.c \
     src/nxt_port_rpc.c \
     src/nxt_port.c \
-    src/nxt_dyld.c \
     src/nxt_random.c \
-    src/nxt_queue.c \
     src/nxt_rbtree.c \
     src/nxt_mp.c \
-    src/nxt_mem_zone.c \
     src/nxt_string.c \
     src/nxt_utf8.c \
     src/nxt_parse.c \
@@ -66,9 +63,7 @@ NXT_LIB_SRCS=" \
     src/nxt_conn_read.c \
     src/nxt_conn_write.c \
     src/nxt_conn_close.c \
-    src/nxt_event_conn_job_sendfile.c \
     src/nxt_conn_proxy.c \
-    src/nxt_job.c \
     src/nxt_sockaddr.c \
     src/nxt_listen_socket.c \
     src/nxt_upstream.c \
@@ -114,12 +109,20 @@ NXT_LIB_SRCS=" \
 NXT_LIB_UNIT_SRCS="src/nxt_unit.c"
 
 
+# The C test suite needs the NXT_TESTS hooks: fault-injection branches and
+# counters compiled into the core and into libunit.  NXT_TESTS is never a
+# global macro.  "make tests" compiles every core and libunit source a second
+# time with -DNXT_TESTS=1 into these two archives, and only the test programs
+# link them.  unitd, libnxt.a, libunit.a and the language modules are built
+# from the plain objects and never see the macro.
+#
+NXT_LIB_TEST_STATIC="libnxt-tests.a"
+NXT_LIB_UNIT_TEST_STATIC="libunit-tests.a"
+
+
 NXT_LIB_TLS_DEPS="src/nxt_tls.h"
 NXT_LIB_TLS_SRCS="src/nxt_cert.c"
 NXT_LIB_OPENSSL_SRCS="src/nxt_openssl.c"
-NXT_LIB_GNUTLS_SRCS="src/nxt_gnutls.c"
-NXT_LIB_CYASSL_SRCS="src/nxt_cyassl.c"
-NXT_LIB_POLARSSL_SRCS="src/nxt_polarssl.c"
 
 NXT_LIB_PCRE_SRCS="src/nxt_pcre.c"
 NXT_LIB_PCRE2_SRCS="src/nxt_pcre2.c"
@@ -153,6 +156,8 @@ NXT_TEST_BUILD_SRCS="src/nxt_test_build.c"
 
 NXT_TEST_DEPS="src/test/nxt_tests.h \
     src/test/nxt_rbtree1.h \
+    src/nxt_checked.h \
+    src/nxt_span.h \
 "
 
 NXT_TEST_SRCS=" \
@@ -162,16 +167,66 @@ NXT_TEST_SRCS=" \
     src/test/nxt_term_parse_test.c \
     src/test/nxt_msec_diff_test.c \
     src/test/nxt_mp_test.c \
-    src/test/nxt_mem_zone_test.c \
     src/test/nxt_lvlhsh_test.c \
     src/test/nxt_gmtime_test.c \
     src/test/nxt_sprintf_test.c \
     src/test/nxt_malloc_test.c \
     src/test/nxt_utf8_test.c \
+    src/test/nxt_utf8_sanitize_test.c \
     src/test/nxt_rbtree1_test.c \
     src/test/nxt_http_parse_test.c \
     src/test/nxt_strverscmp_test.c \
     src/test/nxt_base64_test.c \
+    src/test/nxt_string_test.c \
+    src/test/nxt_buf_test.c \
+    src/test/nxt_http_chunk_parse_test.c \
+    src/test/nxt_http_validate_host_test.c \
+    src/test/nxt_http_request_body_alloc_test.c \
+    src/test/nxt_conf_parse_test.c \
+    src/test/nxt_port_fail_test.c \
+    src/test/nxt_fd_event_change_test.c \
+    src/test/nxt_port_use_unless_zero_test.c \
+    src/test/nxt_port_mmap_range_test.c \
+    src/test/nxt_port_mmap_read_test.c \
+    src/test/nxt_port_mmaps_max_test.c \
+    src/test/nxt_port_ready_test.c \
+    src/test/nxt_conn_close_idle_test.c \
+    src/test/nxt_listen_event_test.c \
+    src/test/nxt_conn_io_accept_test.c \
+    src/test/nxt_runtime_idle_close_test.c \
+    src/test/nxt_router_new_port_test.c \
+    src/test/nxt_router_start_fail_test.c \
+    src/test/nxt_router_start_fail_soak_test.c \
+    src/test/nxt_router_start_proto_gone_test.c \
+    src/test/nxt_router_proto_wedge_test.c \
+    src/test/nxt_router_proto_death_test.c \
+    src/test/nxt_router_start_timeout_test.c \
+    src/test/nxt_router_app_timeout_test.c \
+    src/test/nxt_router_remove_pid_soak_test.c \
+    src/test/nxt_router_detached_test.c \
+    src/test/nxt_router_sender_test.c \
+    src/test/nxt_router_stale_joint_test.c \
+    src/test/nxt_router_websocket_test.c \
+    src/test/nxt_main_start_process_reply_test.c \
+    src/test/nxt_main_file_store_test.c \
+    src/test/nxt_main_store_test.c \
+    src/test/nxt_proto_creating_wedge_test.c \
+    src/test/nxt_main_whoami_test.c \
+    src/test/nxt_main_remove_child_pid_test.c \
+    src/test/nxt_port_change_file_test.c \
+    src/test/nxt_port_ctrunc_test.c \
+    src/test/nxt_port_fd_test.c \
+    src/test/nxt_port_rpc_fd_test.c \
+    src/test/nxt_port_queued_fd_test.c \
+    src/test/nxt_controller_peer_test.c \
+    src/test/nxt_checked_test.c \
+    src/test/nxt_conn_close_test.c \
+    src/test/nxt_router_prepare_msg_test.c \
+    src/test/nxt_router_response_parse_test.c \
+    src/test/nxt_port_frag_test.c \
+    src/test/nxt_port_release_test.c \
+    src/test/nxt_nncq_bound_test.c \
+    src/test/nxt_cpu_limit_test.c \
 "
 
 
@@ -179,14 +234,14 @@ if [ $NXT_HAVE_CLONE_NEWUSER = YES ]; then
     NXT_TEST_SRCS="$NXT_TEST_SRCS src/test/nxt_clone_test.c"
 fi
 
-
-NXT_LIB_UTF8_FILE_NAME_TEST_SRCS=" \
-    src/test/nxt_utf8_file_name_test.c \
-"
+if [ "$NXT_HAVE_CGROUP" = "YES" ]; then
+    NXT_TEST_SRCS="$NXT_TEST_SRCS src/test/nxt_cgroup_test.c"
+fi
 
 
 if [ $NXT_HAVE_ROOTFS = YES ]; then
     NXT_LIB_SRCS="$NXT_LIB_SRCS src/nxt_fs_mount.c"
+    NXT_TEST_SRCS="$NXT_TEST_SRCS src/test/nxt_isolation_mount_dst_test.c"
 fi
 
 
@@ -198,21 +253,7 @@ fi
 
 if [ $NXT_OPENSSL = YES ]; then
     NXT_LIB_SRCS="$NXT_LIB_SRCS $NXT_LIB_OPENSSL_SRCS"
-fi
-
-
-if [ $NXT_GNUTLS = YES ]; then
-    NXT_LIB_SRCS="$NXT_LIB_SRCS $NXT_LIB_GNUTLS_SRCS"
-fi
-
-
-if [ $NXT_CYASSL = YES ]; then
-    NXT_LIB_SRCS="$NXT_LIB_SRCS $NXT_LIB_CYASSL_SRCS"
-fi
-
-
-if [ $NXT_POLARSSL = YES ]; then
-    NXT_LIB_SRCS="$NXT_LIB_SRCS $NXT_LIB_POLARSSL_SRCS"
+    NXT_TEST_SRCS="$NXT_TEST_SRCS src/test/nxt_openssl_server_init_test.c"
 fi
 
 
@@ -237,6 +278,8 @@ if [ "$NXT_REGEX" = "YES" ]; then
     else
         NXT_LIB_SRCS="$NXT_LIB_SRCS $NXT_LIB_PCRE_SRCS"
     fi
+
+    NXT_TEST_SRCS="$NXT_TEST_SRCS src/test/nxt_regex_test.c"
 fi
 
 if [ "$NXT_HAVE_EPOLL" = "YES" -o "$NXT_TEST_BUILD_EPOLL" = "YES" ]; then
@@ -322,17 +365,23 @@ if [ "$NXT_TEST_BUILD" = "YES" ]; then
 fi
 
 
-if [ $NXT_TESTS = YES ]; then
-    nxt_have=NXT_TESTS . auto/have
+# libunit's message-feeding hook is compiled in for the fuzz targets too.
+if [ -n "$NXT_FUZZ" ]; then
+    nxt_have=NXT_FUZZ_BUILD . auto/have
 fi
 
 
 NXT_FUZZ_SRCS=" \
     fuzzing/nxt_basic_fuzz.c \
+    fuzzing/nxt_http_chunk_fuzz.c \
     fuzzing/nxt_http_controller_fuzz.c \
     fuzzing/nxt_http_h1p_fuzz.c \
     fuzzing/nxt_http_h1p_peer_fuzz.c \
+    fuzzing/nxt_http_h1p_peer_response_fuzz.c \
+    fuzzing/nxt_http_ws_utf8_fuzz.c \
     fuzzing/nxt_json_fuzz.c \
+    fuzzing/nxt_router_app_response_fuzz.c \
+    fuzzing/nxt_unit_msg_fuzz.c \
 "
 
 

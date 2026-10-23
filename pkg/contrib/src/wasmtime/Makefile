@@ -1,7 +1,7 @@
 # wasmtime
 
 include $(dir $(abspath $(lastword $(MAKEFILE_LIST))))/version
-WASMTIME_URL := https://github.com/bytecodealliance/wasmtime/releases/download/v$(WASMTIME_VERSION)/wasmtime-v$(WASMTIME_VERSION)-src.tar.gz
+WASMTIME_URL := https://packages.freeunit.org/wasmtime/wasmtime-v$(WASMTIME_VERSION)-src.tar.gz
 
 PKGS += wasmtime
 
@@ -23,6 +23,7 @@ wasmtime: wasmtime-v$(WASMTIME_VERSION)-src.tar.gz .sum-wasmtime
 .wasmtime: wasmtime
 	cd $< && cmake \
 				-DCMAKE_INSTALL_LIBDIR=lib \
+				-DWASMTIME_FEATURE_WASI_HTTP=OFF \
 				-S crates/c-api \
 				-B target/c-api \
 				--install-prefix "$(TOPSRC)/wasmtime/artifacts"

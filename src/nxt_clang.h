@@ -12,6 +12,48 @@
 #define nxt_noinline   __attribute__((noinline))
 #define nxt_cdecl
 
+/*
+ * An intended switch fall-through.  It is a statement and not a comment.
+ * Thus -Wimplicit-fallthrough accepts it under both GCC and Clang.  That
+ * warning is part of --hardening=strict, see auto/cc/hardening.  A "Fall
+ * through." comment alone satisfies the default heuristic of GCC.  It does
+ * not satisfy Clang.
+ */
+#if (NXT_HAVE_GCC_ATTRIBUTE_FALLTHROUGH)
+#define nxt_fallthrough  __attribute__((__fallthrough__))
+#else
+#define nxt_fallthrough
+#endif
+
+
+/*
+ * nxt_static_assert() fails the compilation when the condition does not
+ * hold.  auto/cc/test adds -std=gnu11 only on its gcc and clang branches
+ * and leaves the generic "cc" branch alone, so a compiler defaulting to
+ * pre-C11 has to fall back to declaring an array with a negative size;
+ * there the message survives only in the type name, which has to be unique
+ * per use, hence the token pasting.
+ */
+
+#if (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L)
+
+#define nxt_static_assert(cond, msg)                                          \
+    _Static_assert(cond, msg)
+
+#else
+
+#define nxt_static_assert_paste(prefix, line)                                 \
+    prefix##line
+
+#define nxt_static_assert_name(prefix, line)                                  \
+    nxt_static_assert_paste(prefix, line)
+
+#define nxt_static_assert(cond, msg)                                          \
+    typedef char nxt_static_assert_name(nxt_static_assert_failed_,            \
+                                        __LINE__)[(cond) ? 1 : -1]
+
+#endif
+
 
 #if (NXT_CLANG)
 

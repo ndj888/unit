@@ -5,10 +5,13 @@ import pytest
 
 from unit.applications.lang.node import ApplicationNode
 from unit.applications.websockets import ApplicationWebsocket
+from unit.control import Control
+from unit.option import option
 
 prerequisites = {'modules': {'node': 'any'}}
 
 client = ApplicationNode()
+control = Control()
 ws = ApplicationWebsocket()
 
 
@@ -237,6 +240,7 @@ def test_node_websockets_handshake_connection_absent():  # FAIL
             'Sec-WebSocket-Protocol': 'chat',
             'Sec-WebSocket-Version': 13,
         },
+        connection_close=False,
     )
 
     assert resp['status'] == 400, 'status'
@@ -368,9 +372,8 @@ def test_node_websockets_protocol_absent():
 
 # autobahn-testsuite
 #
-# Some following tests fail because of Unit does not support UTF-8
-# validation for websocket frames.  It should be implemented
-# by application, if necessary.
+# The router validates the payload of a text message and the reason of a
+# close frame as UTF-8 and fails the connection with 1007 when it is not.
 
 
 def test_node_websockets_1_1_1__1_1_8():
@@ -492,22 +495,19 @@ def test_node_websockets_2_10__2_11():
 
     _, sock, _ = ws.upgrade()
 
-    for i in range(0, 10):
-        ws.frame_write(sock, ws.OP_PING, f'payload-{i}')
+    pings = [f'payload-{i}' for i in range(0, 10)]
 
-    for i in range(0, 10):
-        frame = ws.frame_read(sock)
-        check_frame(frame, True, ws.OP_PONG, f'payload-{i}')
+    for payload in pings:
+        ws.frame_write(sock, ws.OP_PING, payload)
+
+    ws.pongs_read(sock, pings)
 
     # 2_11
 
-    for i in range(0, 10):
-        opcode = ws.OP_PING
-        ws.frame_write(sock, opcode, f'payload-{i}', chopsize=1)
+    for payload in pings:
+        ws.frame_write(sock, ws.OP_PING, payload, chopsize=1)
 
-    for i in range(0, 10):
-        frame = ws.frame_read(sock)
-        check_frame(frame, True, ws.OP_PONG, f'payload-{i}')
+    ws.pongs_read(sock, pings)
 
     close_connection(sock)
 
@@ -1041,28 +1041,26 @@ def test_node_websockets_6_1_1__6_4_4():
 
     close_connection(sock)
 
+    # 6_3_1
 
-#        Unit does not support UTF-8 validation
-#
-#        # 6_3_1 FAIL
-#
-#        payload_1 = '\xce\xba\xe1\xbd\xb9\xcf\x83\xce\xbc\xce\xb5'
-#        payload_2 = '\xed\xa0\x80'
-#        payload_3 = '\x65\x64\x69\x74\x65\x64'
-#
-#        payload = payload_1 + payload_2 + payload_3
-#
-#        ws.message(sock, ws.OP_TEXT, payload)
-#        check_close(sock, 1007)
-#
-#        # 6_3_2 FAIL
-#
-#        _, sock, _ = ws.upgrade()
-#
-#        ws.message(sock, ws.OP_TEXT, payload, fragmention_size=1)
-#        check_close(sock, 1007)
-#
-#        # 6_4_1 ... 6_4_4 FAIL
+    _, sock, _ = ws.upgrade()
+
+    # Raw bytes: written as str these would be encoded to valid UTF-8.
+    payload_1 = b'\xce\xba\xe1\xbd\xb9\xcf\x83\xce\xbc\xce\xb5'
+    payload_2 = b'\xed\xa0\x80'
+    payload_3 = b'\x65\x64\x69\x74\x65\x64'
+
+    payload = payload_1 + payload_2 + payload_3
+
+    ws.message(sock, ws.OP_TEXT, payload)
+    check_close(sock, 1007)
+
+    # 6_3_2
+
+    _, sock, _ = ws.upgrade()
+
+    ws.message(sock, ws.OP_TEXT, payload, fragmention_size=1)
+    check_close(sock, 1007)
 
 
 def test_node_websockets_7_1_1__7_5_1():
@@ -1190,16 +1188,17 @@ def test_node_websockets_7_1_1__7_5_1():
     ws.frame_write(sock, ws.OP_CLOSE, payload)
     check_close(sock, 1002)
 
+    # 7_5_1
 
-#        # 7_5_1 FAIL Unit does not support UTF-8 validation
-#
-#        _, sock, _ = ws.upgrade()
-#
-#        payload = ws.serialize_close(reason = '\xce\xba\xe1\xbd\xb9\xcf' \
-#            '\x83\xce\xbc\xce\xb5\xed\xa0\x80\x65\x64\x69\x74\x65\x64')
-#
-#        ws.frame_write(sock, ws.OP_CLOSE, payload)
-#        check_close(sock, 1007)
+    _, sock, _ = ws.upgrade()
+
+    # A raw reason: 0xed 0xa0 0x80 is a surrogate, which has no valid UTF-8
+    # encoding.
+    payload = ws.serialize_close() + b'\xce\xba\xe1\xbd\xb9\xcf' \
+        b'\x83\xce\xbc\xce\xb5\xed\xa0\x80\x65\x64\x69\x74\x65\x64'
+
+    ws.frame_write(sock, ws.OP_CLOSE, payload)
+    check_close(sock, 1007)
 
 
 def test_node_websockets_7_7_X__7_9_X():
@@ -1262,10 +1261,8 @@ def test_node_websockets_7_13_1__7_13_2():
     check_close(sock, 1002)
 
 
-def test_node_websockets_9_1_1__9_6_6(is_unsafe, system):
-    if not is_unsafe:
-        pytest.skip('unsafe, long run')
-
+@pytest.mark.skipif(not option.unsafe, reason='unsafe, long run')
+def test_node_websockets_9_1_1__9_6_6(system):
     client.load('websockets/mirror')
 
     assert 'success' in client.conf(
@@ -1292,7 +1289,7 @@ def test_node_websockets_9_1_1__9_6_6(is_unsafe, system):
             payload = b'*' * length
 
         ws.frame_write(sock, opcode, payload, chopsize=chopsize)
-        frame = ws.frame_read(sock, read_timeout=5)
+        frame = ws.frame_read(sock, read_timeout=ws.LARGE_MESSAGE_TIMEOUT)
         check_frame(frame, True, opcode, payload)
 
     def check_message(opcode, f_size):
@@ -1302,7 +1299,7 @@ def test_node_websockets_9_1_1__9_6_6(is_unsafe, system):
             payload = b'*' * 4 * 2**20
 
         ws.message(sock, opcode, payload, fragmention_size=f_size)
-        frame = ws.frame_read(sock, read_timeout=5)
+        frame = ws.frame_read(sock, read_timeout=ws.LARGE_MESSAGE_TIMEOUT)
         check_frame(frame, True, opcode, payload)
 
     check_payload(op_text, 64 * 2**10)  # 9_1_1
@@ -1433,3 +1430,90 @@ def test_node_websockets_keepalive_interval():
     check_frame(frame, True, ws.OP_PING, '')  # PING frame
 
     sock.close()
+
+
+def test_node_websockets_timeout_does_not_detach():
+    """An upgraded stream is not a request the deadline gave up on.
+
+    "limits": {"timeout"} re-arms nxt_router_app_timeout() for every non-last
+    message from the application, and the 101 is one, so an idle websocket
+    reaches that handler with the deadline passed.  The request's accounting
+    was already returned by the upgrade, so there is no worker still running
+    it: the router must not report the process "detached", which is its view
+    of a worker holding a request whose deadline passed.
+
+    Only the accounting is asserted.  The handler also answers 503 and drops
+    the stream, which is wrong for a websocket and is issue #422.
+    """
+
+    client.load('websockets/mirror')
+
+    assert 'success' in client.conf(
+        {'timeout': 1}, 'applications/websockets%2Fmirror/limits'
+    ), 'configure timeout'
+
+    _, sock, _ = ws.upgrade()
+
+    # No traffic either way -- keepalive_interval is 0 from the fixture -- so
+    # nothing re-arms the timer and it expires.
+    time.sleep(3)
+
+    processes = (
+        control.conf_get('/status')
+        .get('applications', {})
+        .get('websockets/mirror', {})
+        .get('processes', {})
+    )
+
+    assert processes.get('detached', 0) == 0, (
+        f'an upgraded stream marked the worker detached: {processes}'
+    )
+
+    sock.close()
+
+
+def wait_idle(name, idle, timeout=10):
+    """The idle count of an application, once it settles.
+
+    Read by name rather than compared whole: /status grows keys, and this
+    is about one of them.
+    """
+
+    for _ in range(timeout * 10):
+        processes = control.conf_get('/status')['applications'][name][
+            'processes'
+        ]
+
+        if processes['idle'] == idle:
+            break
+
+        time.sleep(0.1)
+
+    return processes
+
+
+def test_node_websockets_worker_idle_after_close():
+    client.load('websockets/mirror')
+
+    name = 'websockets/mirror'
+
+    _, sock, _ = ws.upgrade()
+
+    ws.frame_write(sock, ws.OP_TEXT, 'blah')
+    check_frame(ws.frame_read(sock), True, ws.OP_TEXT, 'blah')
+
+    # The worker is out of the idle economy while the session is open.
+
+    processes = wait_idle(name, 0)
+
+    assert processes['running'] == 1, 'running while open'
+    assert processes['idle'] == 0, 'busy while open'
+
+    close_connection(sock)
+
+    # And rejoins it when the session ends.
+
+    processes = wait_idle(name, 1)
+
+    assert processes['running'] == 1, 'running after close'
+    assert processes['idle'] == 1, 'idle after close'

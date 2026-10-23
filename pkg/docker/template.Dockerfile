@@ -1,19 +1,20 @@
 FROM @@CONTAINER@@
 
-LABEL org.opencontainers.image.title="Unit (@@MODULE@@)"
-LABEL org.opencontainers.image.description="Official build of Unit for Docker."
-LABEL org.opencontainers.image.url="https://unit.nginx.org"
-LABEL org.opencontainers.image.source="https://github.com/nginx/unit"
-LABEL org.opencontainers.image.documentation="https://unit.nginx.org/installation/#docker-images"
-LABEL org.opencontainers.image.vendor="NGINX Docker Maintainers <docker-maint@nginx.com>"
+LABEL org.opencontainers.image.title="FreeUnit (@@MODULE@@)"
+LABEL org.opencontainers.image.description="Community build of FreeUnit for Docker."
+LABEL org.opencontainers.image.url="https://freeunit.org"
+LABEL org.opencontainers.image.source="https://github.com/freeunitorg/freeunit"
+LABEL org.opencontainers.image.documentation="https://github.com/freeunitorg/freeunit/blob/master/README.md"
+LABEL org.opencontainers.image.vendor="FreeUnit Community <team@freeunit.org>"
 LABEL org.opencontainers.image.version="@@VERSION@@"
 
 RUN set -ex \
     && savedAptMark="$(apt-mark showmanual)" \
     && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confold upgrade \
     && apt-get install --no-install-recommends --no-install-suggests -y \
-         ca-certificates git build-essential libssl-dev libpcre2-dev zlib1g-dev libzstd-dev libbrotli-dev curl pkg-config pkgconf libclang-dev cmake \
-    && export RUST_VERSION=1.89.0 \
+         ca-certificates git build-essential libssl-dev openssl libpcre2-dev zlib1g-dev libzstd-dev libbrotli-dev curl wget pkg-config pkgconf libclang-dev cmake \
+    && export RUST_VERSION=1.95.0 \
     && export RUSTUP_HOME=/usr/src/unit/rustup \
     && export CARGO_HOME=/usr/src/unit/cargo \
     && export PATH=/usr/src/unit/cargo/bin:$PATH \
@@ -35,12 +36,12 @@ RUN set -ex \
     && mkdir -p /usr/lib/unit/modules /usr/lib/unit/debug-modules \
     && mkdir -p /usr/src/unit \
     && cd /usr/src/unit \
-    && git clone --depth 1 -b @@VERSION@@-@@PATCHLEVEL@@ https://github.com/nginx/unit \
+    && git clone --depth 1 -b @@VERSION@@ https://github.com/freeunitorg/freeunit unit \
     && cd unit \
     && NCPU="$(getconf _NPROCESSORS_ONLN)" \
     && DEB_HOST_MULTIARCH="$(dpkg-architecture -q DEB_HOST_MULTIARCH)" \
-    && CC_OPT="$(DEB_BUILD_MAINT_OPTIONS="hardening=+all,-pie" DEB_CFLAGS_MAINT_APPEND="-Wp,-D_FORTIFY_SOURCE=2 -fPIC" dpkg-buildflags --get CFLAGS)" \
-    && LD_OPT="$(DEB_BUILD_MAINT_OPTIONS="hardening=+all,-pie" DEB_LDFLAGS_MAINT_APPEND="-Wl,--as-needed -pie" dpkg-buildflags --get LDFLAGS)" \
+    && CC_OPT="$(DEB_BUILD_MAINT_OPTIONS="hardening=+all,-pie" DEB_CFLAGS_MAINT_APPEND="-fPIC" dpkg-buildflags --get CFLAGS | tr ' ' '\n' | grep -v '^-specs=' | tr '\n' ' ')" \
+    && LD_OPT="$(DEB_BUILD_MAINT_OPTIONS="hardening=+all,-pie" DEB_LDFLAGS_MAINT_APPEND="-Wl,--as-needed -pie" dpkg-buildflags --get LDFLAGS | tr ' ' '\n' | grep -v '^-specs=' | tr '\n' ' ')" \
     && CONFIGURE_ARGS_MODULES="--prefix=/usr \
                 --statedir=/var/lib/unit \
                 --control=unix:/var/run/control.unit.sock \
@@ -80,7 +81,8 @@ RUN set -ex \
     && cd \
     && rm -rf /usr/src/unit \
     && for f in /usr/sbin/unitd /usr/lib/unit/modules/*.unit.so; do \
-        ldd $f | awk '/=>/{print $(NF-1)}' | while read n; do dpkg-query -S $n; done | sed 's/^\([^:]\+\):.*$/\1/' | sort | uniq >> /requirements.apt; \
+        [ -f "$f" ] || continue; \
+        ldd "$f" | awk '/=>/{print $(NF-1)}' | while read n; do dpkg-query -S $(realpath $n 2>/dev/null || echo $n) 2>/dev/null; done | grep -v '^diversion' | sed 's/^\([^:]\+\):.*$/\1/' | sort | uniq >> /requirements.apt; \
        done \
     && apt-mark showmanual | xargs apt-mark auto > /dev/null \
     && { [ -z "$savedAptMark" ] || apt-mark manual $savedAptMark; } \
@@ -105,6 +107,7 @@ RUN set -ex \
 
 COPY docker-entrypoint.sh /usr/local/bin/
 COPY welcome.* /usr/share/unit/welcome/
+COPY seccomp-no-af-alg.json /usr/share/unit/
 
 STOPSIGNAL SIGTERM
 

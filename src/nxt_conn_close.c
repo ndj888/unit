@@ -27,13 +27,24 @@ nxt_conn_close(nxt_event_engine_t *engine, nxt_conn_t *c)
         .l_linger = 0,
     };
 
-    nxt_debug(c->socket.task, "conn close fd:%d, to:%d",
-              c->socket.fd, c->socket.timedout);
+    nxt_debug(c->socket.task, "conn close fd:%d, to:%d, cl:%d",
+              c->socket.fd, c->socket.timedout, c->closing);
 
     /*
-     * Disable all pending write operations because on success they
-     * will incorrectly call a ready handler set for nxt_conn_close().
+     * A handler queued before the first close may close again; a second
+     * close handler would run the release handler twice.
      */
+    if (c->closing) {
+        return;
+    }
+
+    c->closing = 1;
+
+    /*
+     * Read or write handlers already queued must not touch the socket or
+     * call the previous state's handlers.
+     */
+    c->block_read = 1;
     c->write = NULL;
 
     if (c->socket.timedout) {
@@ -119,9 +130,7 @@ nxt_conn_close_handler(nxt_task_t *task, void *obj, void *data)
         nxt_socket_close(task, c->socket.fd);
         c->socket.fd = -1;
 
-        if (c->idle) {
-            engine->closed_conns_cnt++;
-        }
+        nxt_conn_untrack(engine, c);
 
         if (timers_pending == 0) {
             nxt_work_queue_add(&engine->fast_work_queue,
@@ -157,9 +166,7 @@ nxt_conn_close_timer_handler(nxt_task_t *task, void *obj, void *data)
         nxt_socket_close(task, c->socket.fd);
         c->socket.fd = -1;
 
-        if (c->idle) {
-            engine->closed_conns_cnt++;
-        }
+        nxt_conn_untrack(engine, c);
     }
 
     nxt_work_queue_add(&engine->fast_work_queue, c->write_state->ready_handler,

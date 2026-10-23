@@ -1,3 +1,4 @@
+import socket
 import struct
 import time
 
@@ -6,6 +7,7 @@ from packaging import version
 
 from unit.applications.lang.python import ApplicationPython
 from unit.applications.websockets import ApplicationWebsocket
+from unit.option import option
 
 prerequisites = {
     'modules': {'python': lambda v: version.parse(v) >= version.parse('3.5')}
@@ -170,7 +172,11 @@ def test_asgi_websockets_length_long():
     ws.frame_write(sock, ws.OP_TEXT, 'fragment1', fin=False)
     ws.frame_write(sock, ws.OP_CONT, 'fragment2', length=2**64 - 1)
 
-    check_close(sock, 1009)  # 1009 - CLOSE_TOO_LARGE
+    # 1002 - CLOSE_PROTOCOL_ERROR.  RFC 6455 §5.2 requires the
+    # high bit of the 64-bit extended payload length to be 0; an
+    # all-ones length is a protocol violation and gets rejected
+    # before the policy-size check (1009 CLOSE_TOO_LARGE) runs.
+    check_close(sock, 1002)
 
 
 def test_asgi_websockets_frame_fragmentation_invalid():
@@ -208,13 +214,21 @@ def test_asgi_websockets_large():
 
     ws.frame_write(sock, ws.OP_TEXT, message)
 
+    # check_frame() asserts fin and opcode as well as the payload.  This
+    # test used to read a second frame and concatenate it, which is how it
+    # sat for 30s on every run: frame_read() fills frame['data'] whatever
+    # the opcode is, the frame that eventually arrived was the zero-length
+    # keepalive PING (websocket_conf.keepalive_interval,
+    # src/nxt_router.c:2904), and appending b'' left the comparison true.
+    #
+    # The mirror echoes a message as one frame, so one read is right here.
+    # test_node_websockets_large reads twice on purpose: it loads
+    # websockets/mirror_fragmentation, whose app.js omits the
+    # fragmentOutgoingMessages and fragmentationThreshold overrides that
+    # websockets/mirror sets, so that server really does fragment.
     frame = ws.frame_read(sock)
-    data = frame['data'].decode('utf-8')
 
-    frame = ws.frame_read(sock)
-    data += frame['data'].decode('utf-8')
-
-    assert message == data, 'large'
+    check_frame(frame, True, ws.OP_TEXT, message)
 
     sock.close()
 
@@ -289,6 +303,7 @@ def test_asgi_websockets_handshake_connection_absent():  # FAIL
             'Sec-WebSocket-Protocol': 'chat',
             'Sec-WebSocket-Version': 13,
         },
+        connection_close=False,
     )
 
     assert resp['status'] == 400, 'status'
@@ -420,9 +435,8 @@ def test_asgi_websockets_protocol_absent():
 
 # autobahn-testsuite
 #
-# Some following tests fail because of Unit does not support UTF-8
-# validation for websocket frames.  It should be implemented
-# by application, if necessary.
+# The router validates the payload of a text message and the reason of a
+# close frame as UTF-8 and fails the connection with 1007 when it is not.
 
 
 def test_asgi_websockets_1_1_1__1_1_8():
@@ -544,22 +558,53 @@ def test_asgi_websockets_2_10__2_11():
 
     _, sock, _ = ws.upgrade()
 
-    for i in range(0, 10):
-        ws.frame_write(sock, ws.OP_PING, f'payload-{i}')
+    pings = [f'payload-{i}' for i in range(0, 10)]
 
-    for i in range(0, 10):
-        frame = ws.frame_read(sock)
-        check_frame(frame, True, ws.OP_PONG, f'payload-{i}')
+    for payload in pings:
+        ws.frame_write(sock, ws.OP_PING, payload)
+
+    ws.pongs_read(sock, pings)
 
     # 2_11
 
-    for i in range(0, 10):
-        opcode = ws.OP_PING
-        ws.frame_write(sock, opcode, f'payload-{i}', chopsize=1)
+    for payload in pings:
+        ws.frame_write(sock, ws.OP_PING, payload, chopsize=1)
 
-    for i in range(0, 10):
-        frame = ws.frame_read(sock)
-        check_frame(frame, True, ws.OP_PONG, f'payload-{i}')
+    ws.pongs_read(sock, pings)
+
+    close_connection(sock)
+
+
+def test_asgi_websockets_ping_pong_pending():
+    client.load('websockets/mirror')
+
+    # A client with a small receive buffer sends many PINGs and does not
+    # read.  While a PONG is not sent, the router must keep only the PONG
+    # for the most recent PING (RFC 6455 Section 5.5.3).  The connection
+    # must stay open, and the last PING must get its PONG.
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.connect(('127.0.0.1', 8080))
+
+    _, sock, _ = ws.upgrade(sock=sock)
+
+    pings = [f'{i:05}'.encode() * 25 for i in range(2000)]
+
+    sock.sendall(b''.join(ws.frame_to_send(ws.OP_PING, p) for p in pings))
+
+    answered = ws.pongs_read(sock, pings)
+
+    assert answered[0] == 0, 'first ping answered'
+    assert len(answered) < len(pings), 'pings not answered'
+
+    message = 'still open'
+
+    ws.frame_write(sock, ws.OP_TEXT, message)
+
+    frame = ws.frame_read(sock)
+    check_frame(frame, True, ws.OP_TEXT, message)
 
     close_connection(sock)
 
@@ -1093,28 +1138,35 @@ def test_asgi_websockets_6_1_1__6_4_4():
 
     close_connection(sock)
 
+    # 6_3_1
 
-#        Unit does not support UTF-8 validation
-#
-#        # 6_3_1 FAIL
-#
-#        payload_1 = '\xce\xba\xe1\xbd\xb9\xcf\x83\xce\xbc\xce\xb5'
-#        payload_2 = '\xed\xa0\x80'
-#        payload_3 = '\x65\x64\x69\x74\x65\x64'
-#
-#        payload = payload_1 + payload_2 + payload_3
-#
-#        ws.message(sock, ws.OP_TEXT, payload)
-#        check_close(sock, 1007)
-#
-#        # 6_3_2 FAIL
-#
-#        _, sock, _ = ws.upgrade()
-#
-#        ws.message(sock, ws.OP_TEXT, payload, fragmention_size=1)
-#        check_close(sock, 1007)
-#
-#        # 6_4_1 ... 6_4_4 FAIL
+    _, sock, _ = ws.upgrade()
+
+    # Raw bytes: written as str these would be encoded to valid UTF-8.
+    payload_1 = b'\xce\xba\xe1\xbd\xb9\xcf\x83\xce\xbc\xce\xb5'
+    payload_2 = b'\xed\xa0\x80'
+    payload_3 = b'\x65\x64\x69\x74\x65\x64'
+
+    payload = payload_1 + payload_2 + payload_3
+
+    ws.message(sock, ws.OP_TEXT, payload)
+    check_close(sock, 1007)
+
+    # 6_3_2
+
+    _, sock, _ = ws.upgrade()
+
+    ws.message(sock, ws.OP_TEXT, payload, fragmention_size=1)
+    check_close(sock, 1007)
+
+    # A text message whose last frame ends inside a multi-byte sequence: the
+    # frame is complete, the message is not valid UTF-8.
+
+    _, sock, _ = ws.upgrade()
+
+    ws.frame_write(sock, ws.OP_TEXT, b'\xce')
+
+    check_close(sock, 1007)
 
 
 def test_asgi_websockets_7_1_1__7_5_1():
@@ -1242,16 +1294,26 @@ def test_asgi_websockets_7_1_1__7_5_1():
     ws.frame_write(sock, ws.OP_CLOSE, payload)
     check_close(sock, 1002)
 
+    # 7_5_1
 
-#        # 7_5_1 FAIL Unit does not support UTF-8 validation
-#
-#        _, sock, _ = ws.upgrade()
-#
-#        payload = ws.serialize_close(reason = '\xce\xba\xe1\xbd\xb9\xcf' \
-#            '\x83\xce\xbc\xce\xb5\xed\xa0\x80\x65\x64\x69\x74\x65\x64')
-#
-#        ws.frame_write(sock, ws.OP_CLOSE, payload)
-#        check_close(sock, 1007)
+    _, sock, _ = ws.upgrade()
+
+    # A raw reason: 0xed 0xa0 0x80 is a surrogate, which has no valid UTF-8
+    # encoding.
+    payload = ws.serialize_close() + b'\xce\xba\xe1\xbd\xb9\xcf' \
+        b'\x83\xce\xbc\xce\xb5\xed\xa0\x80\x65\x64\x69\x74\x65\x64'
+
+    ws.frame_write(sock, ws.OP_CLOSE, payload)
+    check_close(sock, 1007)
+
+    # A close reason that is valid UTF-8 but not ASCII is accepted.
+
+    _, sock, _ = ws.upgrade()
+
+    payload = ws.serialize_close() + b'\xce\xba'
+
+    ws.frame_write(sock, ws.OP_CLOSE, payload)
+    check_close(sock)
 
 
 def test_asgi_websockets_7_7_X__7_9_X():
@@ -1314,10 +1376,8 @@ def test_asgi_websockets_7_13_1__7_13_2():
     check_close(sock, 1002)
 
 
-def test_asgi_websockets_9_1_1__9_6_6(is_unsafe, system):
-    if not is_unsafe:
-        pytest.skip('unsafe, long run')
-
+@pytest.mark.skipif(not option.unsafe, reason='unsafe, long run')
+def test_asgi_websockets_9_1_1__9_6_6(system):
     client.load('websockets/mirror')
 
     assert 'success' in client.conf(
@@ -1344,7 +1404,7 @@ def test_asgi_websockets_9_1_1__9_6_6(is_unsafe, system):
             payload = b'*' * length
 
         ws.frame_write(sock, opcode, payload, chopsize=chopsize)
-        frame = ws.frame_read(sock, read_timeout=5)
+        frame = ws.frame_read(sock, read_timeout=ws.LARGE_MESSAGE_TIMEOUT)
         check_frame(frame, True, opcode, payload)
 
     def check_message(opcode, f_size):
@@ -1354,7 +1414,7 @@ def test_asgi_websockets_9_1_1__9_6_6(is_unsafe, system):
             payload = b'*' * 4 * 2**20
 
         ws.message(sock, opcode, payload, fragmention_size=f_size)
-        frame = ws.frame_read(sock, read_timeout=5)
+        frame = ws.frame_read(sock, read_timeout=ws.LARGE_MESSAGE_TIMEOUT)
         check_frame(frame, True, opcode, payload)
 
     check_payload(op_text, 64 * 2**10)  # 9_1_1
@@ -1422,6 +1482,191 @@ def test_asgi_websockets_10_1_1():
     check_frame(frame, True, ws.OP_TEXT, payload)
 
     close_connection(sock)
+
+
+def check_mirror(sock, opcode, payload):
+    """Read one message the mirror application echoed back.
+
+    A refusal arrives as a CLOSE frame instead, and check_frame() decodes a
+    TEXT body as UTF-8, so a 2-byte close body would surface as a
+    UnicodeDecodeError rather than the close code.  Name the code.
+    """
+    frame = ws.frame_read(sock)
+
+    assert frame['opcode'] != ws.OP_CLOSE, f"closed with {frame.get('code')}"
+
+    check_frame(frame, True, opcode, payload)
+
+
+def test_asgi_websockets_fragmented_message_over_1mb():
+    client.load('websockets/mirror')
+
+    _, sock, _ = ws.upgrade()
+
+    # 2 MiB in 32 fragments of 64 KiB.  Every frame is far below the default
+    # 1 MiB max_frame_size, so the router admits all of them; the module used
+    # to sum them against a private per-message 1 MiB of its own.
+    payload = '*' * 2 * 2**20
+
+    ws.message(sock, ws.OP_TEXT, payload, fragmention_size=64 * 2**10)
+
+    check_mirror(sock, ws.OP_TEXT, payload)
+
+    close_connection(sock)
+
+
+def test_asgi_websockets_message_after_fragmented_message():
+    client.load('websockets/mirror')
+
+    _, sock, _ = ws.upgrade()
+
+    # Three non-final 300 KiB fragments and a 100 KiB final one: under 1 MiB
+    # in total, so this message passed even the old cap.
+    payload = '*' * (3 * 300 * 2**10 + 100 * 2**10)
+
+    ws.message(sock, ws.OP_TEXT, payload, fragmention_size=300 * 2**10)
+
+    check_mirror(sock, ws.OP_TEXT, payload)
+
+    # The old per-frame counter was never reset when the final fragment was
+    # delivered straight to a waiting receive(), so 900 KiB stayed on it and
+    # this 512 KiB frame was charged against 1 MiB - 900 KiB.  That depends on
+    # the message above taking the direct-delivery branch, which the mirror
+    # application makes near-certain but does not guarantee: if this ever
+    # reports a 1009 on an unfixed build, rerun it, do not add a sleep.
+    payload = '*' * 512 * 2**10
+
+    ws.frame_write(sock, ws.OP_TEXT, payload)
+
+    check_mirror(sock, ws.OP_TEXT, payload)
+
+    close_connection(sock)
+
+
+def test_asgi_websockets_frame_over_buffer_limit():
+    client.load('websockets/mirror')
+
+    assert 'success' in client.conf(
+        {
+            'http': {
+                'websocket': {
+                    'max_frame_size': 16777216,
+                    'keepalive_interval': 0,
+                }
+            }
+        },
+        'settings',
+    ), 'increase max_frame_size'
+
+    _, sock, _ = ws.upgrade()
+
+    # A single frame the configuration allows but which is larger than the
+    # module's own 10 MiB accumulation limit.  The floor on that limit is what
+    # admits it; this is the only coverage of that branch outside --unsafe.
+    payload = '*' * 11 * 2**20
+
+    ws.frame_write(sock, ws.OP_TEXT, payload)
+
+    check_mirror(sock, ws.OP_TEXT, payload)
+
+    close_connection(sock)
+
+
+def test_asgi_websockets_message_at_buffer_limit():
+    client.load('websockets/mirror')
+
+    _, sock, _ = ws.upgrade()
+
+    # A masked frame with an 8-byte length carries 14 bytes of header, so this
+    # payload makes a frame of exactly the default 1 MiB max_frame_size.  Ten
+    # of them are 10,485,620 bytes, just under the module's 10 MiB.
+    f_size = 2**20 - 14
+    payload = '*' * (10 * f_size)
+
+    ws.message(sock, ws.OP_TEXT, payload, fragmention_size=f_size)
+
+    check_mirror(sock, ws.OP_TEXT, payload)
+
+    close_connection(sock)
+
+
+def test_asgi_websockets_message_over_buffer_limit():
+    client.load('websockets/mirror')
+
+    _, sock, _ = ws.upgrade()
+
+    # One frame more than the test above: 11,534,182 bytes, over the 10 MiB.
+    # A property test, not a regression one -- an unfixed build also answers
+    # 1009 here, on the second frame rather than the eleventh.
+    f_size = 2**20 - 14
+    payload = '*' * (11 * f_size)
+
+    ws.message(sock, ws.OP_TEXT, payload, fragmention_size=f_size)
+
+    check_close(sock, 1009)  # 1009 - CLOSE_TOO_LARGE
+
+
+def test_asgi_websockets_second_frame_over_buffer_limit():
+    client.load('websockets/mirror')
+
+    assert 'success' in client.conf(
+        {
+            'http': {
+                'websocket': {
+                    'max_frame_size': 33554432,
+                    'keepalive_interval': 0,
+                }
+            }
+        },
+        'settings',
+    ), 'increase max_frame_size'
+
+    _, sock, _ = ws.upgrade()
+
+    # The floor admits one over-limit frame into an empty queue and no more,
+    # so the connection holds at most one.  Non-final, so it is suspended
+    # whatever the application is doing.  Also a property test: an unfixed
+    # build refuses the 12 MiB frame itself.
+    ws.frame_write(sock, ws.OP_TEXT, '*' * 12 * 2**20, fin=False)
+
+    # Without this pause the CONT frame can reach the application before the
+    # 12 MiB frame has been processed; on CI that failed with "Invalid state:
+    # attempt to process CONT frame".
+    time.sleep(2)
+
+    ws.frame_write(sock, ws.OP_CONT, '*', fin=True)
+
+    check_close(sock, 1009)  # 1009 - CLOSE_TOO_LARGE
+
+
+def test_asgi_websockets_close_after_frame_over_buffer_limit():
+    client.load('websockets/mirror')
+
+    assert 'success' in client.conf(
+        {
+            'http': {
+                'websocket': {
+                    'max_frame_size': 33554432,
+                    'keepalive_interval': 0,
+                }
+            }
+        },
+        'settings',
+    ), 'increase max_frame_size'
+
+    _, sock, _ = ws.upgrade()
+
+    ws.frame_write(sock, ws.OP_TEXT, '*' * 12 * 2**20, fin=False)
+
+    # The same pause as above: let the 12 MiB frame be processed first.
+    time.sleep(2)
+
+    # CLOSE is exempt from the accumulation limit: it is at most 125 bytes and
+    # refusing it would replace the disconnect the application is owed with a
+    # 1009.  Drop the exemption and this returns 1009 instead of 1000.
+    ws.frame_write(sock, ws.OP_CLOSE, ws.serialize_close())
+
+    check_close(sock)
 
 
 # settings

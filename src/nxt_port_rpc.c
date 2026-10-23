@@ -25,9 +25,63 @@ struct nxt_port_rpc_reg_s {
 };
 
 
+static void *nxt_port_rpc_reg_add(nxt_task_t *task, nxt_port_t *port,
+    nxt_port_rpc_handler_t ready_handler, nxt_port_rpc_handler_t error_handler,
+    uint32_t stream, size_t ex_size);
 static void
 nxt_port_rpc_remove_from_peers(nxt_task_t *task, nxt_port_t *port,
     nxt_port_rpc_reg_t *reg);
+
+#if (NXT_TESTS)
+static nxt_uint_t  nxt_port_rpc_test_alloc_failure_count;
+static nxt_uint_t  nxt_port_rpc_test_insert_failure_count;
+
+
+void
+nxt_port_rpc_test_alloc_failures(nxt_uint_t failures)
+{
+    nxt_port_rpc_test_alloc_failure_count = failures;
+}
+
+
+void
+nxt_port_rpc_test_insert_failures(nxt_uint_t failures)
+{
+    nxt_port_rpc_test_insert_failure_count = failures;
+}
+
+
+/*
+ * Set the next stream identifier and return the previous one.  A test uses
+ * it to reach the 32-bit wrap and to restore the counter afterwards.  It is
+ * a plain store: the tests are single-threaded.
+ */
+
+uint32_t
+nxt_port_rpc_test_set_stream_ident(uint32_t stream)
+{
+    uint32_t  old;
+
+    old = *nxt_stream_ident;
+    *nxt_stream_ident = stream;
+
+    return old;
+}
+
+
+static nxt_bool_t
+nxt_port_rpc_test_should_fail(nxt_uint_t *failures)
+{
+    if (*failures == 0) {
+        return 0;
+    }
+
+    (*failures)--;
+
+    return 1;
+}
+
+#endif
 
 
 nxt_int_t
@@ -122,13 +176,66 @@ nxt_port_rpc_register_handler_ex(nxt_task_t *task, nxt_port_t *port,
     nxt_port_rpc_handler_t ready_handler, nxt_port_rpc_handler_t error_handler,
     size_t ex_size)
 {
-    uint32_t            stream;
+    uint32_t  stream;
+
+    /* Stream 0 means "no handler" to the callers: skip it after a wrap. */
+
+    do {
+        stream = nxt_atomic_fetch_add(nxt_stream_ident, 1);
+    } while (nxt_slow_path(stream == 0));
+
+    return nxt_port_rpc_reg_add(task, port, ready_handler, error_handler,
+                                stream, ex_size);
+}
+
+
+/*
+ * Register a handler on a stream the caller names rather than on a fresh one.
+ *
+ * The one caller is a router that has just been told, by its own deadline,
+ * that a start it asked for will not be answered, and that wants to keep
+ * watching the stream for the reply that may still come: the worker's late
+ * PROCESS_READY, or the REMOVE_PID for it that the process's death produces.
+ * See nxt_router_app_start_expired() in src/nxt_router.c.
+ *
+ * Only safe from inside that stream's own handler, because
+ * nxt_port_rpc_handler() deletes the registration before it runs the handler
+ * and does not delete again afterwards -- so the key is free at that point,
+ * and nothing removes what this puts back.  Anywhere else the insert would
+ * either collide with a live registration or be undone by the caller's own
+ * cleanup, and the stream identifier itself is only unique until
+ * nxt_stream_ident wraps.
+ */
+
+void *
+nxt_port_rpc_register_handler_at(nxt_task_t *task, nxt_port_t *port,
+    nxt_port_rpc_handler_t ready_handler, nxt_port_rpc_handler_t error_handler,
+    uint32_t stream, size_t ex_size)
+{
+    return nxt_port_rpc_reg_add(task, port, ready_handler, error_handler,
+                                stream, ex_size);
+}
+
+
+static void *
+nxt_port_rpc_reg_add(nxt_task_t *task, nxt_port_t *port,
+    nxt_port_rpc_handler_t ready_handler, nxt_port_rpc_handler_t error_handler,
+    uint32_t stream, size_t ex_size)
+{
     nxt_port_rpc_reg_t  *reg;
     nxt_lvlhsh_query_t  lhq;
 
     nxt_assert(port->pair[0] != -1);
 
-    stream = nxt_atomic_fetch_add(nxt_stream_ident, 1);
+#if (NXT_TESTS)
+    if (nxt_slow_path(nxt_port_rpc_test_should_fail(
+                          &nxt_port_rpc_test_alloc_failure_count)))
+    {
+        nxt_debug(task, "rpc: stream #%uD failed to allocate reg", stream);
+
+        return NULL;
+    }
+#endif
 
     reg = nxt_mp_zalloc(port->mem_pool, sizeof(nxt_port_rpc_reg_t) + ex_size);
 
@@ -148,6 +255,18 @@ nxt_port_rpc_register_handler_ex(nxt_task_t *task, nxt_port_t *port,
     lhq.replace = 0;
     lhq.value = reg;
     lhq.pool = port->mem_pool;
+
+#if (NXT_TESTS)
+    if (nxt_slow_path(nxt_port_rpc_test_should_fail(
+                          &nxt_port_rpc_test_insert_failure_count)))
+    {
+        nxt_debug(task, "rpc: stream #%uD failed to add reg", stream);
+
+        nxt_mp_free(port->mem_pool, reg);
+
+        return NULL;
+    }
+#endif
 
     switch (nxt_lvlhsh_insert(&port->rpc_streams, &lhq)) {
 
@@ -332,6 +451,15 @@ nxt_port_rpc_handler(nxt_task_t *task, nxt_port_recv_msg_t *msg)
     if (ret != NXT_OK) {
         nxt_debug(task, "rpc: stream #%uD no handler found", stream);
 
+        /*
+         * No handler ran, so nothing can have taken the descriptors this
+         * message arrived with.  The dispatcher would close them anyway;
+         * doing it here keeps the reject path self-evidently safe, since
+         * the stream number is a value off the wire and any peer can name
+         * one that was never registered.
+         */
+        nxt_port_recv_msg_close_fds(msg);
+
         return;
     }
 
@@ -489,11 +617,55 @@ nxt_port_rpc_cancel(nxt_task_t *task, nxt_port_t *port, uint32_t stream)
 
 static nxt_buf_t  nxt_port_close_dummy_buf;
 
+
+static void
+nxt_port_rpc_error_msg(nxt_task_t *task, nxt_port_t *port, uint32_t stream)
+{
+    nxt_port_recv_msg_t  msg;
+
+    msg.fd[0] = -1;
+    msg.fd[1] = -1;
+    msg.buf = &nxt_port_close_dummy_buf;
+    msg.port = port;
+    msg.port_msg.stream = stream;
+    msg.port_msg.pid = nxt_pid;
+    msg.port_msg.type = _NXT_PORT_MSG_RPC_ERROR;
+    msg.port_msg.last = 1;
+    msg.port_msg.mmap = 0;
+    msg.port_msg.nf = 0;
+    msg.port_msg.mf = 0;
+    msg.size = 0;
+    msg.cancelled = 0;
+    msg.u.data = NULL;
+
+    nxt_port_rpc_handler(task, &msg);
+}
+
+
+/*
+ * Fail one registered RPC as though the peer had answered RPC_ERROR: the
+ * registered error handler runs and the registration is retired, so a caller
+ * that has decided the answer will never come reuses that handler's recovery
+ * instead of duplicating it.
+ *
+ * Safe on a stream that is already gone -- nxt_port_rpc_handler() drops an
+ * unknown stream with a debug line -- which is what makes it usable from a
+ * deadline timer racing a real reply.
+ */
+
+void
+nxt_port_rpc_error(nxt_task_t *task, nxt_port_t *port, uint32_t stream)
+{
+    nxt_debug(task, "rpc: stream #%uD fail registration", stream);
+
+    nxt_port_rpc_error_msg(task, port, stream);
+}
+
+
 void
 nxt_port_rpc_close(nxt_task_t *task, nxt_port_t *port)
 {
-    nxt_port_rpc_reg_t   *reg;
-    nxt_port_recv_msg_t  msg;
+    nxt_port_rpc_reg_t  *reg;
 
     for ( ;; ) {
         reg = nxt_lvlhsh_peek(&port->rpc_streams, &lvlhsh_rpc_reg_proto);
@@ -501,21 +673,6 @@ nxt_port_rpc_close(nxt_task_t *task, nxt_port_t *port)
             return;
         }
 
-        msg.fd[0] = -1;
-        msg.fd[1] = -1;
-        msg.buf = &nxt_port_close_dummy_buf;
-        msg.port = port;
-        msg.port_msg.stream = reg->stream;
-        msg.port_msg.pid = nxt_pid;
-        msg.port_msg.type = _NXT_PORT_MSG_RPC_ERROR;
-        msg.port_msg.last = 1;
-        msg.port_msg.mmap = 0;
-        msg.port_msg.nf = 0;
-        msg.port_msg.mf = 0;
-        msg.size = 0;
-        msg.cancelled = 0;
-        msg.u.data = NULL;
-
-        nxt_port_rpc_handler(task, &msg);
+        nxt_port_rpc_error_msg(task, port, reg->stream);
     }
 }

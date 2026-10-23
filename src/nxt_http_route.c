@@ -493,6 +493,13 @@ nxt_http_route_match_create(nxt_task_t *task, nxt_router_temp_conf_t *tmcf,
     }
 
     if (mtcf.host != NULL) {
+        /*
+         * Host matching is intentionally always case-insensitive
+         * (LOWCASE).  Per RFC 9110 §4.2.3 the host component is
+         * case-insensitive, and there is no per-rule sensitivity
+         * flag — an admin expecting case-sensitive host filtering
+         * will not get it from this rule.
+         */
         rule = nxt_http_route_rule_create(task, mp, mtcf.host, 1,
                                           NXT_HTTP_ROUTE_PATTERN_LOWCASE,
                                           NXT_HTTP_URI_ENCODING_NONE);
@@ -1176,6 +1183,33 @@ nxt_http_route_pattern_create(nxt_task_t *task, nxt_mp_t *mp,
 }
 
 
+/*
+ * Configured pattern strings are decoded once here, at configuration time,
+ * by nxt_decode_uri() ("uri") or nxt_decode_uri_plus() ("arguments" and
+ * "query").  A regex pattern ("~...") is compiled as written and is not
+ * decoded.
+ *
+ * The request side does not use these helpers, and the two sides are not
+ * symmetric.
+ *
+ * The request path is decoded by nxt_http_parse_complex_target() in
+ * src/nxt_http_parse.c:
+ *   - most decoded bytes go back through its state machine, so an encoded
+ *     dot segment such as "/%2e%2e/" is normalized like "/../";
+ *   - a decoded '%', '#' or '?' is copied as a plain byte;
+ *   - "%00" is rejected;
+ *   - "/./" and "/../" segments and a trailing "/." or "/.." are removed,
+ *     and repeated slashes are merged;
+ *   - "encoded_slashes" keeps "%25" and "%2F" encoded, but only the
+ *     controller sets it.  The router never does.
+ * So a pattern that spells "%2e%2e" or "//" as a whole path segment can
+ * never match a normalized path.  A ".." inside a segment ("/a..b") is
+ * kept on both sides and compares as plain bytes.
+ *
+ * Request arguments and the query are decoded by nxt_http_arguments_parse()
+ * in src/nxt_http_request.c: '+' becomes a space, a bad or short "%XX" is
+ * copied as is, and "%00" is accepted.
+ */
 static nxt_int_t
 nxt_http_route_decode_str(nxt_str_t *str, nxt_http_uri_encoding_t encoding)
 {
@@ -1950,7 +1984,7 @@ nxt_http_route_header(nxt_http_request_t *r, nxt_http_route_rule_t *rule)
 
     ret = 0;
 
-    nxt_list_each(f, r->fields) {
+    nxt_http_fields_each(f, r->inline_fields, r->num_inline_fields, r->fields) {
 
         if (rule->u.name.hash != f->hash
             || rule->u.name.length != f->name_length
@@ -1969,7 +2003,7 @@ nxt_http_route_header(nxt_http_request_t *r, nxt_http_route_rule_t *rule)
             return ret;
         }
 
-    } nxt_list_loop;
+    } nxt_http_fields_loop;
 
     return ret;
 }
@@ -2147,7 +2181,17 @@ nxt_http_route_pattern(nxt_http_request_t *r, nxt_http_route_pattern_t *pattern,
 #if (NXT_HAVE_REGEX)
     if (pattern->regex) {
         if (r->regex_match == NULL) {
-            r->regex_match = nxt_regex_match_create(r->mem_pool, 0);
+            /*
+             * One match object serves every pattern tested against this
+             * request.  Its match data holds the minimum ovector: one
+             * offset pair, the overall match.  The matcher does not read
+             * captures.  pcre2_match_data_create() treats an ovecsize of 0
+             * as 1 (pcre2_match_data_create(3)); 1 is passed to make the
+             * minimum explicit.  With PCRE1 the size counts ints, not
+             * pairs; pcre_exec() then returns 0 on a match, and
+             * nxt_regex_match() counts 0 as a match.
+             */
+            r->regex_match = nxt_regex_match_create(r->mem_pool, 1);
             if (nxt_slow_path(r->regex_match == NULL)) {
                 return NXT_ERROR;
             }
@@ -2228,6 +2272,11 @@ nxt_http_route_memcmp(u_char *start, u_char *test, size_t test_length,
     nxt_bool_t case_sensitive)
 {
     nxt_int_t  n;
+
+    /* A "" pattern slice has a NULL start: no memcmp(NULL, p, 0). */
+    if (test_length == 0) {
+        return 1;
+    }
 
     if (case_sensitive) {
         n = memcmp(start, test, test_length);

@@ -55,6 +55,8 @@ struct nxt_runtime_s {
     uint8_t                batch;
     uint8_t                status;
     uint8_t                is_pid_isolated;
+    /* See nxt_port_quit_mode_t in nxt_port.h. */
+    uint8_t                quit_mode;
 
     const char             *engine;
     uint32_t               engine_connections;
@@ -76,11 +78,21 @@ struct nxt_runtime_s {
     mode_t                 control_mode;
     const char             *control_user;
     const char             *control_group;
+    nxt_uid_t              control_uid;        /* resolved, or -1 */
+    nxt_gid_t              control_gid;        /* resolved, or -1 */
 
     nxt_str_t              certs;
     nxt_str_t              scripts;
 
     nxt_queue_t            engines;            /* of nxt_event_engine_t */
+
+    /*
+     * The engine that owns this runtime, recorded when it is created.  The
+     * router adds worker engines to the queue above, so "the runtime's own
+     * engine" cannot be derived from it, and rt->port_by_type[rt->type] is
+     * cleared during shutdown while worker engines are still running.
+     */
+    nxt_event_engine_t     *main_engine;
 
     nxt_sockaddr_t         *controller_listen;
     nxt_listen_socket_t    *controller_socket;
@@ -102,13 +114,17 @@ nxt_int_t nxt_runtime_thread_pool_create(nxt_thread_t *thr, nxt_runtime_t *rt,
 
 void nxt_runtime_process_add(nxt_task_t *task, nxt_process_t *process);
 void nxt_runtime_process_remove(nxt_runtime_t *rt, nxt_process_t *process);
+void nxt_runtime_process_unlink_locked(nxt_runtime_t *rt,
+    nxt_process_t *process);
 
 nxt_process_t *nxt_runtime_process_find(nxt_runtime_t *rt, nxt_pid_t pid);
+nxt_process_t *nxt_runtime_process_ref(nxt_runtime_t *rt, nxt_pid_t pid);
 
 nxt_process_t *nxt_runtime_process_first(nxt_runtime_t *rt,
     nxt_lvlhsh_each_t *lhe);
 
-void nxt_runtime_process_release(nxt_runtime_t *rt, nxt_process_t *process);
+void nxt_runtime_process_release(nxt_task_t *task, nxt_runtime_t *rt,
+    nxt_process_t *process);
 
 #define nxt_runtime_process_next(rt, lhe)                                     \
     nxt_lvlhsh_each(&rt->processes, lhe)
@@ -118,6 +134,8 @@ nxt_port_t *nxt_runtime_process_port_create(nxt_task_t *task, nxt_runtime_t *rt,
 
 void nxt_runtime_port_remove(nxt_task_t *task, nxt_port_t *port);
 void nxt_runtime_stop_app_processes(nxt_task_t *task, nxt_runtime_t *rt);
+void nxt_runtime_port_send_quit(nxt_task_t *task, nxt_runtime_t *rt,
+    nxt_port_t *port);
 
 NXT_EXPORT nxt_port_t *nxt_runtime_port_find(nxt_runtime_t *rt, nxt_pid_t pid,
     nxt_port_id_t port_id);
@@ -125,6 +143,9 @@ NXT_EXPORT nxt_port_t *nxt_runtime_port_find(nxt_runtime_t *rt, nxt_pid_t pid,
 
 /* STUB */
 nxt_int_t nxt_runtime_controller_socket(nxt_task_t *task, nxt_runtime_t *rt);
+nxt_bool_t nxt_controller_peer_allowed(nxt_uid_t uid, nxt_gid_t gid,
+    const nxt_gid_t *groups, nxt_uint_t ngroups, nxt_uid_t euid,
+    nxt_uid_t ctl_uid, nxt_gid_t ctl_gid);
 
 nxt_str_t *nxt_current_directory(nxt_mp_t *mp);
 
@@ -166,6 +187,12 @@ void nxt_http_register_js_proto(nxt_js_conf_t *jcf);
 
 extern nxt_module_init_t  nxt_init_modules[];
 extern nxt_uint_t         nxt_init_modules_n;
+
+
+#if (NXT_TESTS)
+/* The idle-connection close pass, for the idle close dispatch test. */
+void nxt_runtime_test_close_idle_connections(nxt_event_engine_t *engine);
+#endif
 
 
 #endif /* _NXT_RUNTIME_H_INCLIDED_ */

@@ -31,15 +31,18 @@
 
 #if (NXT_HAVE_LINUX_NS)
 static nxt_int_t nxt_process_pipe_timer(nxt_fd_t fd, short event);
-static nxt_int_t nxt_process_check_pid_status(const nxt_fd_t *gc_pipe);
-static nxt_pid_t nxt_process_recv_pid(const nxt_fd_t *pid_pipe,
-    const nxt_fd_t *gc_pipe);
+static void nxt_process_fd_close(nxt_fd_t *fd);
+static void nxt_process_pipe_close(nxt_fd_t *pp);
+static nxt_int_t nxt_process_recv_status(const nxt_fd_t *gc_pipe);
+static void nxt_process_send_status(const nxt_fd_t *gc_pipe, int8_t status);
+static nxt_pid_t nxt_process_recv_pid(const nxt_fd_t *pid_pipe);
 static void nxt_process_send_pid(const nxt_fd_t *pid_pipe, nxt_pid_t pid);
 static nxt_int_t nxt_process_unshare(nxt_task_t *task, nxt_process_t *process,
-    nxt_fd_t *pid_pipe, nxt_fd_t *gc_pipe, nxt_bool_t use_pidns);
-static nxt_int_t nxt_process_init_pidns(nxt_task_t *task,
+    nxt_fd_t *pid_pipe, nxt_fd_t *gc_pipe, nxt_bool_t use_pidns,
+    nxt_bool_t use_cgroup);
+static nxt_int_t nxt_process_init_pipes(nxt_task_t *task,
     const nxt_process_t *process, nxt_fd_t *pid_pipe, nxt_fd_t *gc_pipe,
-    nxt_bool_t *use_pidns);
+    nxt_bool_t *use_pidns, nxt_bool_t *use_cgroup);
 #endif
 
 static nxt_pid_t nxt_process_create(nxt_task_t *task, nxt_process_t *process);
@@ -136,10 +139,70 @@ nxt_process_new(nxt_runtime_t *rt)
 void
 nxt_process_use(nxt_task_t *task, nxt_process_t *process, int i)
 {
-    process->use_count += i;
+    nxt_int_t      use_count;
+    nxt_bool_t     released;
+    nxt_runtime_t  *rt;
 
-    if (process->use_count == 0) {
-        nxt_runtime_process_release(task->thread->runtime, process);
+    rt = task->thread->runtime;
+
+    /*
+     * The count is mutated from every engine thread, so it is serialized on
+     * rt->processes_mutex rather than made atomic: an atomic increment would
+     * still let a lookup take a reference on a process whose teardown has
+     * already started.  Dropping to zero therefore unlinks the process from
+     * rt->processes while the mutex is still held, which makes {find, ref}
+     * and {unref to zero, unlink} mutually exclusive.  The teardown itself
+     * runs after the unlock -- it takes other locks and must not nest.
+     *
+     * This makes rt->processes_mutex reachable from any nxt_port_use()
+     * that drops a last port reference, including callers that already hold
+     * app->mutex (nxt_router.c).  rt->processes_mutex must therefore stay a
+     * leaf: nothing may take another lock while holding it.  It is one today
+     * only because the single outward call made while holding it,
+     * nxt_runtime_process_add() -> nxt_runtime_port_add() -> nxt_port_use(),
+     * passes a positive delta and so cannot reach nxt_port_release() and
+     * back into this function.  A -1 reached under this mutex would
+     * self-deadlock the calling thread.
+     */
+
+    nxt_thread_mutex_lock(&rt->processes_mutex);
+
+    process->use_count += i;
+    use_count = process->use_count;
+
+    /*
+     * A second drop to zero is not detectable from use_count or registered
+     * -- a resurrect-then-release leaves both exactly as the first teardown
+     * left them -- so it is latched here instead.  This has to act rather
+     * than assert: nxt_assert() compiles to nothing in a non-debug build,
+     * and the second release is worse than a double free.  On rt->main_engine
+     * it tears the process down while the first teardown is still queued; off
+     * it, it posts process->free_work a second time, and
+     * nxt_locked_work_queue_add() then self-links the item so that the
+     * engine draining it spins forever.
+     */
+
+    released = process->released;
+
+    if (use_count == 0 && !released) {
+        process->released = 1;
+
+        nxt_runtime_process_unlink_locked(rt, process);
+    }
+
+    nxt_thread_mutex_unlock(&rt->processes_mutex);
+
+    if (use_count == 0) {
+        if (nxt_slow_path(released)) {
+            nxt_assert(!released);
+
+            nxt_alert(task, "process %PI dropped to zero twice, leaking it "
+                      "rather than tearing it down again", process->pid);
+
+            return;
+        }
+
+        nxt_runtime_process_release(task, rt, process);
     }
 }
 
@@ -287,7 +350,25 @@ nxt_process_child_fixup(nxt_task_t *task, nxt_process_t *process)
 
     rt = task->thread->runtime;
 
-    /* Remove not ready processes. */
+    /*
+     * Remove not ready processes.
+     *
+     * These walks hand unreferenced processes to nxt_process_close_ports(),
+     * which takes its own +1/-1 -- the shape that made nxt_port_remove_pid()
+     * a double release once the refcount became cross-thread.  It is safe
+     * here for a different reason than everywhere else, and not because of
+     * the refcount: this runs immediately after fork() in the child, which
+     * is single-threaded by definition, so no other thread exists to have
+     * dropped the last reference.  nxt_runtime_process_each() iterating
+     * rt->processes without the mutex is safe for the same reason.
+     *
+     * The other half of that, now that nxt_process_use() locks
+     * rt->processes_mutex: the mutex is inherited across fork() and would be
+     * held forever in the child if any other thread of the parent held it at
+     * the call.  None can -- only main and prototype fork, both take the
+     * mutex on their single event engine, and their thread-pool threads
+     * never touch it.
+     */
     nxt_runtime_process_each(rt, p) {
 
         if (nxt_proc_keep_matrix[ptype][nxt_process_type(p)] == 0
@@ -367,51 +448,74 @@ nxt_process_pipe_timer(nxt_fd_t fd, short event)
 }
 
 
+static void
+nxt_process_fd_close(nxt_fd_t *fd)
+{
+    if (*fd != -1) {
+        close(*fd);
+        *fd = -1;
+    }
+}
+
+
+static void
+nxt_process_pipe_close(nxt_fd_t *pp)
+{
+    /* A pipe that nxt_process_init_pipes() did not create is -1. */
+
+    nxt_process_fd_close(&pp[0]);
+    nxt_process_fd_close(&pp[1]);
+}
+
+
 static nxt_int_t
-nxt_process_check_pid_status(const nxt_fd_t *gc_pipe)
+nxt_process_recv_status(const nxt_fd_t *gc_pipe)
 {
     int8_t   status = -1;
     ssize_t  ret;
-
-    close(gc_pipe[1]);
 
     ret = nxt_process_pipe_timer(gc_pipe[0], POLLIN);
     if (ret == NXT_OK) {
         read(gc_pipe[0], &status, sizeof(int8_t));
     }
 
-    close(gc_pipe[0]);
-
     return status;
 }
 
 
-static nxt_pid_t
-nxt_process_recv_pid(const nxt_fd_t *pid_pipe, const nxt_fd_t *gc_pipe)
+static void
+nxt_process_send_status(const nxt_fd_t *gc_pipe, int8_t status)
 {
-    int8_t     status;
+    /*
+     * The parent keeps its read end open until nxt_process_pipe_close().
+     * So this write does not get EPIPE when the child has exited.
+     */
+    if (gc_pipe[1] != -1) {
+        write(gc_pipe[1], &status, sizeof(int8_t));
+    }
+}
+
+
+static nxt_pid_t
+nxt_process_recv_pid(const nxt_fd_t *pid_pipe)
+{
     ssize_t    ret;
     nxt_pid_t  pid;
 
     close(pid_pipe[1]);
-    close(gc_pipe[0]);
 
-    status = 0;
+    pid = -1;
 
     ret = nxt_process_pipe_timer(pid_pipe[0], POLLIN);
     if (ret == NXT_OK) {
         ret = read(pid_pipe[0], &pid, sizeof(nxt_pid_t));
-    }
 
-    if (ret <= 0) {
-        status = -1;
-        pid = -1;
+        if (ret <= 0) {
+            pid = -1;
+        }
     }
-
-    write(gc_pipe[1], &status, sizeof(int8_t));
 
     close(pid_pipe[0]);
-    close(gc_pipe[1]);
 
     return pid;
 }
@@ -436,74 +540,124 @@ nxt_process_send_pid(const nxt_fd_t *pid_pipe, nxt_pid_t pid)
 static nxt_int_t
 nxt_process_unshare(nxt_task_t *task, nxt_process_t *process,
                     nxt_fd_t *pid_pipe, nxt_fd_t *gc_pipe,
-                    nxt_bool_t use_pidns)
+                    nxt_bool_t use_pidns, nxt_bool_t use_cgroup)
 {
     int        ret;
     nxt_pid_t  pid;
 
-    if (process->isolation.clone.flags == 0) {
-        return NXT_OK;
-    }
+    /*
+     * The child only reads gc_pipe.  Without its own write end, a read
+     * gets end of file when the parent exits.
+     */
+    nxt_process_fd_close(&gc_pipe[1]);
 
-    ret = unshare(process->isolation.clone.flags);
-    if (nxt_slow_path(ret == -1)) {
-        nxt_alert(task, "unshare() failed for %s %E", process->name,
-                  nxt_errno);
-
-        if (use_pidns) {
-            nxt_pipe_close(task, gc_pipe);
-            nxt_pipe_close(task, pid_pipe);
+    if (use_cgroup) {
+        /*
+         * Wait until the parent has moved this process into its cgroup.
+         * A new cgroup namespace is rooted at the cgroup of the process
+         * at unshare() time.  A process from the fork(2) below starts in
+         * the cgroup of this process.
+         */
+        if (nxt_process_recv_status(gc_pipe) != 0) {
+            goto fail;
         }
-
-        return NXT_ERROR;
-    }
-
-    if (!use_pidns) {
-        return NXT_OK;
     }
 
     /*
-     * PID namespace requested. Employ a double fork(2) technique
-     * so that the prototype process will be placed into the new
-     * namespace and end up with PID 1 (as before with clone).
+     * Unshare all flags in one call.  With CLONE_NEWUSER, the kernel checks
+     * the other flags with the credentials from before the call.  A second
+     * unshare() after CLONE_NEWUSER uses the new credentials and can fail
+     * with EPERM, for example in the unprivileged_userns AppArmor profile
+     * of Ubuntu 24.04.
      */
-    pid = fork();
-    if (nxt_slow_path(pid < 0)) {
-        nxt_alert(task, "fork() failed for %s %E", process->name, nxt_errno);
-        nxt_pipe_close(task, gc_pipe);
-        nxt_pipe_close(task, pid_pipe);
-
-        return NXT_ERROR;
-
-    } else if (pid > 0) {
-        nxt_pipe_close(task, gc_pipe);
-        nxt_process_send_pid(pid_pipe, pid);
-
-        _exit(EXIT_SUCCESS);
+    if (process->isolation.clone.flags != 0) {
+        ret = unshare(process->isolation.clone.flags);
+        if (nxt_slow_path(ret == -1)) {
+            nxt_alert(task, "unshare() failed for %s %E", process->name,
+                      nxt_errno);
+            goto fail;
+        }
     }
 
-    nxt_pipe_close(task, pid_pipe);
-    ret = nxt_process_check_pid_status(gc_pipe);
-    if (ret == -1) {
-        return NXT_ERROR;
+    if (use_pidns) {
+        /*
+         * PID namespace requested. Employ a double fork(2) technique
+         * so that the prototype process will be placed into the new
+         * namespace and end up with PID 1 (as before with clone).
+         */
+        pid = fork();
+        if (nxt_slow_path(pid < 0)) {
+            nxt_alert(task, "fork() failed for %s %E", process->name,
+                      nxt_errno);
+            goto fail;
+
+        } else if (pid > 0) {
+            nxt_process_pipe_close(gc_pipe);
+            nxt_process_send_pid(pid_pipe, pid);
+
+            _exit(EXIT_SUCCESS);
+        }
+
+        nxt_process_pipe_close(pid_pipe);
+
+        /* Wait until the parent has the pid of this process. */
+
+        if (nxt_process_recv_status(gc_pipe) != 0) {
+            goto fail;
+        }
     }
+
+    nxt_process_pipe_close(gc_pipe);
 
     return NXT_OK;
+
+fail:
+
+    nxt_process_pipe_close(gc_pipe);
+    nxt_process_pipe_close(pid_pipe);
+
+    return NXT_ERROR;
 }
 
 
 static nxt_int_t
-nxt_process_init_pidns(nxt_task_t *task, const nxt_process_t *process,
+nxt_process_init_pipes(nxt_task_t *task, const nxt_process_t *process,
                        nxt_fd_t *pid_pipe, nxt_fd_t *gc_pipe,
-                       nxt_bool_t *use_pidns)
+                       nxt_bool_t *use_pidns, nxt_bool_t *use_cgroup)
 {
-    int ret;
+    int  ret;
+
+    pid_pipe[0] = pid_pipe[1] = -1;
+    gc_pipe[0] = gc_pipe[1] = -1;
 
     *use_pidns = 0;
+    *use_cgroup = 0;
 
 #if (NXT_HAVE_CLONE_NEWPID)
     *use_pidns = nxt_is_pid_isolated(process);
 #endif
+
+#if (NXT_HAVE_CGROUP)
+    *use_cgroup = (process->isolation.cgroup.path != NULL);
+#endif
+
+    if (!*use_pidns && !*use_cgroup) {
+        return NXT_OK;
+    }
+
+    /*
+     * gc_pipe carries status bytes from the parent to the new process.
+     * With a cgroup path, the parent sends 0 after it has moved the child
+     * into the cgroup.  The child waits for it before unshare() and before
+     * the pid isolation fork(2).  With pid isolation, the parent sends 0
+     * after it has read the pid of the grandchild from pid_pipe.  The
+     * grandchild waits for it.  -1, end of file or a timeout make the
+     * process exit.
+     */
+    ret = nxt_pipe_create(task, gc_pipe, 0, 0);
+    if (nxt_slow_path(ret == NXT_ERROR)) {
+        return NXT_ERROR;
+    }
 
     if (!*use_pidns) {
         return NXT_OK;
@@ -511,11 +665,7 @@ nxt_process_init_pidns(nxt_task_t *task, const nxt_process_t *process,
 
     ret = nxt_pipe_create(task, pid_pipe, 0, 0);
     if (nxt_slow_path(ret == NXT_ERROR)) {
-        return NXT_ERROR;
-    }
-
-    ret = nxt_pipe_create(task, gc_pipe, 0, 0);
-    if (nxt_slow_path(ret == NXT_ERROR)) {
+        nxt_process_pipe_close(gc_pipe);
         return NXT_ERROR;
     }
 
@@ -542,9 +692,10 @@ nxt_process_create(nxt_task_t *task, nxt_process_t *process)
 
 #if (NXT_HAVE_LINUX_NS)
     nxt_fd_t       pid_pipe[2], gc_pipe[2];
-    nxt_bool_t     use_pidns;
+    nxt_bool_t     use_pidns, use_cgroup;
 
-    ret = nxt_process_init_pidns(task, process, pid_pipe, gc_pipe, &use_pidns);
+    ret = nxt_process_init_pipes(task, process, pid_pipe, gc_pipe,
+                                 &use_pidns, &use_cgroup);
     if (ret == NXT_ERROR) {
         return -1;
     }
@@ -553,6 +704,12 @@ nxt_process_create(nxt_task_t *task, nxt_process_t *process)
     pid = fork();
     if (nxt_slow_path(pid < 0)) {
         nxt_alert(task, "fork() failed for %s %E", process->name, nxt_errno);
+
+#if (NXT_HAVE_LINUX_NS)
+        nxt_process_pipe_close(gc_pipe);
+        nxt_process_pipe_close(pid_pipe);
+#endif
+
         return pid;
     }
 
@@ -560,7 +717,8 @@ nxt_process_create(nxt_task_t *task, nxt_process_t *process)
         /* Child. */
 
 #if (NXT_HAVE_LINUX_NS)
-        ret = nxt_process_unshare(task, process, pid_pipe, gc_pipe, use_pidns);
+        ret = nxt_process_unshare(task, process, pid_pipe, gc_pipe,
+                                  use_pidns, use_cgroup);
         if (ret == NXT_ERROR) {
             _exit(EXIT_FAILURE);
         }
@@ -588,12 +746,56 @@ nxt_process_create(nxt_task_t *task, nxt_process_t *process)
 
     nxt_debug(task, "fork(%s): %PI", process->name, pid);
 
+#if (NXT_HAVE_CGROUP)
+    /*
+     * Move the child into its cgroup by the pid from fork().  The child
+     * waits for the status byte below before unshare() and before the pid
+     * isolation fork(2).  So a new cgroup namespace is rooted at this
+     * cgroup, and the grandchild starts in it.
+     */
+    ret = nxt_cgroup_proc_add(task, process, pid);
+    if (nxt_slow_path(ret != NXT_OK)) {
+        nxt_alert(task, "cgroup: failed to add process %s to %s %E",
+                  process->name, process->isolation.cgroup.path, nxt_errno);
+        nxt_cgroup_cleanup(task, process);
+
 #if (NXT_HAVE_LINUX_NS)
+        /* The child waits for the status byte.  -1 makes it exit. */
+
+        nxt_process_send_status(gc_pipe, -1);
+        nxt_process_pipe_close(gc_pipe);
+        nxt_process_pipe_close(pid_pipe);
+#else
+        kill(pid, SIGTERM);
+#endif
+
+        return -1;
+    }
+#endif
+
+#if (NXT_HAVE_LINUX_NS)
+    if (use_cgroup) {
+        nxt_process_send_status(gc_pipe, 0);
+    }
+
     if (use_pidns) {
-        pid = nxt_process_recv_pid(pid_pipe, gc_pipe);
-        if (pid == -1) {
-            return pid;
+        pid = nxt_process_recv_pid(pid_pipe);
+        nxt_process_send_status(gc_pipe, (pid == -1) ? -1 : 0);
+    }
+
+    nxt_process_pipe_close(gc_pipe);
+
+    if (pid == -1) {
+#if (NXT_HAVE_CGROUP)
+        if (use_cgroup) {
+            /*
+             * The child can still be in the cgroup.  Then rmdir() fails
+             * and the directory stays.
+             */
+            nxt_cgroup_cleanup(task, process);
         }
+#endif
+        return pid;
     }
 #endif
 
@@ -614,17 +816,6 @@ nxt_process_create(nxt_task_t *task, nxt_process_t *process)
     } else {
         nxt_runtime_process_add(task, process);
     }
-
-#if (NXT_HAVE_CGROUP)
-    ret = nxt_cgroup_proc_add(task, process);
-    if (nxt_slow_path(ret != NXT_OK)) {
-        nxt_alert(task, "cgroup: failed to add process %s to %s %E",
-                  process->name, process->isolation.cgroup.path, nxt_errno);
-        nxt_cgroup_cleanup(task, process);
-        kill(pid, SIGTERM);
-        return -1;
-    }
-#endif
 
     return pid;
 }
@@ -913,6 +1104,40 @@ nxt_process_created_ok(nxt_task_t *task, nxt_port_recv_msg_t *msg, void *data)
     init = nxt_process_init(process);
 
     ret = nxt_process_apply_creds(task, process);
+
+    if (nxt_slow_path(ret == NXT_DECLINED)) {
+        /*
+         * capset() is filtered and nxt_capability_still_held() found
+         * this process carrying capabilities because of it, or could
+         * not establish that it is not.  Only a prototype reaches
+         * nxt_process_created_ok(): the core processes set
+         * NXT_PROCESS_STATE_READY in nxt_process_core_setup() and never
+         * send PROCESS_CREATED, and an application worker never sends
+         * one either, because nxt_app_setup() returns init->start()
+         * directly and that call does not come back with NXT_OK.  The
+         * entire remaining job of a prototype is to fork workers that
+         * would inherit those sets.  Refuse the start
+         * instead, and say which syscall and which consequence, so the
+         * operator's next step is to allow capset() rather than to
+         * hunt for a broken application.
+         *
+         * The refusal is visible: this exits nonzero, main's SIGCHLD
+         * reaper notifies the router with the start's stream still
+         * attached (main clears ->stream only once the NEW_PORT that
+         * answers the start has gone out, and a prototype that died
+         * here never sent the PROCESS_READY that would have caused
+         * one), the router turns that REMOVE_PID into an RPC error for
+         * the start attempt, and the requests waiting on the application
+         * are answered 503 rather than left to time out.
+         */
+
+        nxt_alert(task, "%s refused to start: capset() is denied, so the "
+                  "capabilities this process holds cannot be dropped and "
+                  "would be inherited by application code", process->name);
+
+        goto fail;
+    }
+
     if (nxt_slow_path(ret != NXT_OK)) {
         goto fail;
     }
@@ -961,7 +1186,24 @@ nxt_process_core_setup(nxt_task_t *task, nxt_process_t *process)
     nxt_int_t  ret;
 
     ret = nxt_process_apply_creds(task, process);
-    if (nxt_slow_path(ret != NXT_OK)) {
+
+    /*
+     * NXT_DECLINED -- capset() filtered, capabilities still held -- is
+     * warn-and-continue here, unlike on the nxt_process_created_ok()
+     * path.  This is the router, the controller and discovery: they run
+     * no application code, so there is nothing to inherit what they
+     * keep, and refusing costs far more than it buys.  Router and
+     * controller declare .restart = 1 and nxt_main_process_sigchld_
+     * handler() re-forks them immediately and without backoff, so a
+     * filter that denies every attempt would spin a respawn loop
+     * instead of reporting anything; discovery's row in
+     * nxt_proc_remove_notify_matrix is all zeroes and it is the main
+     * process's only startup action, so its death would leave unitd up
+     * with no modules, no control socket and no error.
+     * nxt_capability_drop() has already logged the warning.
+     */
+
+    if (nxt_slow_path(ret != NXT_OK && ret != NXT_DECLINED)) {
         return NXT_ERROR;
     }
 
@@ -1050,7 +1292,23 @@ nxt_process_apply_creds(nxt_task_t *task, nxt_process_t *process)
     }
 #endif
 
-    return NXT_OK;
+    /*
+     * Last: nothing after this point in any child needs a capability,
+     * and everything before it might.  PR_SET_NO_NEW_PRIVS above stops
+     * this process *gaining* privilege across execve(); it does not
+     * take away what the process already carries, and fork() copies
+     * every capability set verbatim, so a unitd that was granted
+     * capabilities would otherwise pass them straight to application
+     * code.  Main never calls apply_creds() and so never drops -- it
+     * binds listeners on every reconfiguration.
+     *
+     * Its NXT_DECLINED -- a filtered capset(), sets still full -- is
+     * passed through rather than folded into either NXT_OK or
+     * NXT_ERROR, because the two callers answer it differently: see
+     * nxt_process_created_ok() and nxt_process_core_setup().
+     */
+
+    return nxt_capability_drop(task);
 }
 
 
@@ -1211,10 +1469,31 @@ nxt_nanosleep(nxt_nsec_t ns)
 }
 
 
+/*
+ * The only way a port is linked into a process's port list.  ->process,
+ * ->link and the reference the port holds on the process are set together
+ * here and dropped together by nxt_port_release(), so they cannot diverge
+ * (#425).  A port that is already paired is refused rather than linked a
+ * second time, in every build: a second insert corrupts the list, and an
+ * nxt_assert() would compile out of a release build.
+ */
+
 void
 nxt_process_port_add(nxt_task_t *task, nxt_process_t *process, nxt_port_t *port)
 {
-    nxt_assert(port->process == NULL);
+    /*
+     * A double add is a bug: trap it in a debug build, refuse it in any.
+     * link.next reads as "already linked" only because a port is never
+     * linked again after nxt_port_release() unlinks it: in a release build
+     * nxt_queue_remove() does not clear the link.
+     */
+    nxt_assert(port->process == NULL && port->link.next == NULL);
+
+    if (nxt_slow_path(port->process != NULL || port->link.next != NULL)) {
+        nxt_alert(task, "port %p %d:%d is already paired with a process",
+                  port, port->pid, port->id);
+        return;
+    }
 
     port->process = process;
     nxt_queue_insert_tail(&process->ports, &port->link);
@@ -1230,6 +1509,13 @@ nxt_process_type(nxt_process_t *process)
         (nxt_process_port_first(process))->type;
 }
 
+
+/*
+ * The caller must hold a reference to the process.  Closing the ports drops
+ * the reference each of them holds, so this takes one of its own to survive
+ * the loop -- but on a process that has already reached zero that same pair
+ * is a fresh 0 -> 1 -> 0 transition, which runs the teardown a second time.
+ */
 
 void
 nxt_process_close_ports(nxt_task_t *task, nxt_process_t *process)
