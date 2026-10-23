@@ -1,8 +1,9 @@
 # About this fork
 `ndj888/unit` is a maintained fork of NGINX Unit.
-Since 1.37.0, this fork uses [FreeUnit](https://github.com/freeunitorg/freeunit) upstream for security fixes.
-The only fork-specific patch currently carried is `PHP UNIT_REWRITTEN_PATH` ([nginx/unit#1615](https://github.com/nginx/unit/issues/1615)).
+Since 1.37.0, this fork tracks [FreeUnit](https://github.com/freeunitorg/freeunit) as its upstream.
+The only fork-specific patch is the PHP `UNIT_REWRITTEN_PATH` server variable ([nginx/unit#1615](https://github.com/nginx/unit/issues/1615)).
 Find releases at [ndj888/unit/releases](https://github.com/ndj888/unit/releases).
+See [FORK-MAINTENANCE.md](FORK-MAINTENANCE.md) for the Chinese maintenance manual.
 
 # FreeUnit — Community LTS fork of Unit
 
