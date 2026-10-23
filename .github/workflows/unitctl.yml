@@ -279,7 +279,8 @@ jobs:
 
   release:
     # Create a draft release if a tag
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    # The ndj888 fork lacks upstream registry credentials/secrets.
+    if: github.repository == 'freeunitorg/freeunit' && (startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch')
     needs: [build]
     runs-on: ubuntu-latest
     timeout-minutes: 15

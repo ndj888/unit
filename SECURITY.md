@@ -1,3 +1,7 @@
+# Fork Security Notes
+Please also report vulnerabilities affecting FreeUnit through the reporting process below.
+For vulnerabilities limited to this fork, submit a private report at [GitHub Security Advisories](https://github.com/ndj888/unit/security/advisories/new).
+
 # Security Policy
 
 ## Supported Versions

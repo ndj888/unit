@@ -17,19 +17,22 @@ jobs:
     # otherwise burn the owner's Anthropic quota and feed untrusted text into
     # the run (prompt injection). The author_association field differs per
     # event type, so each branch carries its own check.
+    # The ndj888/unit fork lacks upstream secrets; run only upstream.
     if: |
-      (github.event_name == 'issue_comment' &&
-        contains(github.event.comment.body, '@claude') &&
-        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
-      (github.event_name == 'pull_request_review_comment' &&
-        contains(github.event.comment.body, '@claude') &&
-        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
-      (github.event_name == 'pull_request_review' &&
-        contains(github.event.review.body, '@claude') &&
-        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association)) ||
-      (github.event_name == 'issues' &&
-        (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
-        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association))
+      github.repository == 'freeunitorg/freeunit' && (
+        (github.event_name == 'issue_comment' &&
+          contains(github.event.comment.body, '@claude') &&
+          contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
+        (github.event_name == 'pull_request_review_comment' &&
+          contains(github.event.comment.body, '@claude') &&
+          contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
+        (github.event_name == 'pull_request_review' &&
+          contains(github.event.review.body, '@claude') &&
+          contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association)) ||
+        (github.event_name == 'issues' &&
+          (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
+          contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association))
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -73,19 +76,22 @@ jobs:
   # The reply text must NOT contain the literal trigger string, otherwise the
   # bot's own comment re-fires issue_comment and loops forever.
   claude-denied:
+    # The ndj888/unit fork lacks upstream secrets; run only upstream.
     if: |
-      (github.event_name == 'issue_comment' &&
-        contains(github.event.comment.body, '@claude') &&
-        !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
-      (github.event_name == 'pull_request_review_comment' &&
-        contains(github.event.comment.body, '@claude') &&
-        !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
-      (github.event_name == 'pull_request_review' &&
-        contains(github.event.review.body, '@claude') &&
-        !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association)) ||
-      (github.event_name == 'issues' &&
-        (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
-        !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association))
+      github.repository == 'freeunitorg/freeunit' && (
+        (github.event_name == 'issue_comment' &&
+          contains(github.event.comment.body, '@claude') &&
+          !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
+        (github.event_name == 'pull_request_review_comment' &&
+          contains(github.event.comment.body, '@claude') &&
+          !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) ||
+        (github.event_name == 'pull_request_review' &&
+          contains(github.event.review.body, '@claude') &&
+          !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association)) ||
+        (github.event_name == 'issues' &&
+          (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
+          !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association))
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

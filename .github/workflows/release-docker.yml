@@ -50,6 +50,8 @@ jobs:
   # Single source of truth for the release version and the variant list,
   # consumed by both `build` and `merge` via fromJSON().
   setup:
+    # The ndj888 fork lacks upstream registry credentials/secrets.
+    if: github.repository == 'freeunitorg/freeunit'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
