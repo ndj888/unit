@@ -1,7 +1,8 @@
 # wasmtime
 
 include $(dir $(abspath $(lastword $(MAKEFILE_LIST))))/version
-WASMTIME_URL := https://packages.freeunit.org/wasmtime/wasmtime-v$(WASMTIME_VERSION)-src.tar.gz
+# FreeUnit mirror lacks this version.
+WASMTIME_URL := https://github.com/bytecodealliance/wasmtime/releases/download/v$(WASMTIME_VERSION)/wasmtime-v$(WASMTIME_VERSION)-src.tar.gz
 
 PKGS += wasmtime
 

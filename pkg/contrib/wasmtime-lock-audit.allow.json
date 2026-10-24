@@ -13,7 +13,14 @@
       "id": null,
       "package": "chacha20",
       "version": "0.10.0",
-      "reason": "Linked through rand 0.10.1, which wasmtime-wasi uses to seed guest randomness. A yank is not an advisory: no RustSec record applies to this version. 0.10.1 is yanked as well and 0.10.2 is clean, but the Wasmtime 48.0.5 archive is vendored and its lock still names 0.10.0, so the version moves only when the pin does."
+      "reason": "Linked through rand 0.10.1, which wasmtime-wasi uses to seed guest randomness. A yank is not an advisory: no RustSec record applies to this version. 0.10.1 is yanked as well and 0.10.2 is clean, but the Wasmtime 48.0.7 archive is vendored and its lock still names 0.10.0, so the version moves only when the pin does."
+    },
+    {
+      "kind": "unsound",
+      "id": "RUSTSEC-2026-0386",
+      "package": "tokio",
+      "version": "1.51.1",
+      "reason": "The affected tokio::io::unix::AsyncFd constructors have no downstream callers found by inspecting the Wasmtime 48.0.7 source and vendored Rust code: all AsyncFd references occur inside Tokio's own implementation, documentation or tests. The affected Tokio 1.51.1 remains in the immutable vendored archive; patched versions are >=1.51.6,<1.52.0 or >=1.53.3. On 2026-10-24, official crates.io versions and GitHub releases showed 48.0.7 as the latest compatible 48.0.x pin. Accepted for this C API build based on that source inspection; reassess at the next source pin."
     }
   ]
 }

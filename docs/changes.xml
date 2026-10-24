@@ -27,6 +27,30 @@ from FreeUnit master (aae35c6f, freeunitorg/freeunit#595).
 </para>
 </change>
 
+<change type="security">
+<para>
+ndj888/unit updates Rust dependencies on top of FreeUnit 1.37.0.
+Wasmtime 48.0.7 addresses RUSTSEC-2026-0350 through RUSTSEC-2026-0359,
+RUSTSEC-2026-0361 through RUSTSEC-2026-0364, and RUSTSEC-2026-0375
+through RUSTSEC-2026-0379. It also updates Cranelift to 0.135.7 and
+http to 1.5.0.
+</para>
+<para>
+Tracked lock files update Tokio to 1.54.1 for RUSTSEC-2026-0386,
+rustls to 0.23.46 for RUSTSEC-2026-0346 through RUSTSEC-2026-0349,
+rustls-webpki to 0.103.16 for RUSTSEC-2026-0382, and webpki-roots
+to 1.0.10 for RUSTSEC-2026-0381.
+</para>
+<para>
+The Wasmtime C API source comes from the official GitHub release
+because the FreeUnit mirror lacks 48.0.7. Its vendored lock retains
+two documented audit exceptions: yanked chacha20 0.10.0 and Tokio
+1.51.1 affected by RUSTSEC-2026-0386. Source inspection found no
+downstream callers of the affected AsyncFd constructors in this
+pin; these exceptions require review at the next source pin.
+</para>
+</change>
+
 <change type="change">
 <para>
 on Linux, the default number of router threads ("listen_threads") is now at

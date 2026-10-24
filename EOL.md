@@ -95,8 +95,8 @@ needs an upgrade or replacement decision instead.
 | Eclipse Jetty | `jetty-util` / `jetty-server` / `jetty-http` jars bundled by the Java module | 9.4.58.v20250814 | **Aug 2025 (EOL)** † | Jetty 9.4 lost community support on 2025-08-14 and the bundled build is its last release. Needs an upgrade-or-replace decision — Jetty 10/11 are EOL too; 12.x is the supported line. |
 | Eclipse ECJ (JDT batch compiler) | JSP compilation jar bundled by the Java module | 3.26.0 | none published | Tracks Eclipse releases; endoflife.date has no product for it. Pinned build is from Jun 2021; current is 3.42.0 (Jun 2025). |
 | ClassGraph | classpath scanning jar bundled by the Java module | latest | — | No upstream EOL schedule; pinned and bumped as needed. |
-| Wasmtime (C API) | WebAssembly runtime built by `pkg/contrib` and linked by the `wasm` module | 48.0.5 | none published | Fetched as a source tarball (`pkg/contrib/src/wasmtime/version`), so `cargo audit` never sees it; the `Audit (cargo)` pins job queries OSV for the pinned version instead. Same 48.0.5 as the Rust pin below; 48 is a long-term support line. The 47.0.4 to 48.0.5 bump closed twelve advisories from 2026-09-24 and 2026-10-02. The 43.0.1 bump closed RUSTSEC-2026-0269, -0222, -0114 and three wasmtime-wasi path/permission advisories — see #400. |
-| Wasmtime (Rust crate) | WebAssembly runtime used by the `wasm-wasi-component` module | 48.0.5 | none published | `src/wasm-wasi-component/Cargo.lock`, audited by the `Audit (cargo)` workflow on every lock. Bumped with the advisories it closes. |
+| Wasmtime (C API) | WebAssembly runtime built by `pkg/contrib` and linked by the `wasm` module | 48.0.7 | none published | Fetched from the GitHub source release (`pkg/contrib/src/wasmtime/version`) because the FreeUnit mirror lacks v48.0.7. The `Audit (cargo)` pins job checks its source pin against OSV and audits the archived `Cargo.lock` after verifying the archive checksum. Same 48.0.7 as the Rust crate pin below; 48 is a long-term support line. The 47.0.4 to 48.0.5 bump closed twelve advisories from 2026-09-24 and 2026-10-02. The 43.0.1 bump closed RUSTSEC-2026-0269, -0222, -0114 and three wasmtime-wasi path/permission advisories — see #400. |
+| Wasmtime (Rust crate) | WebAssembly runtime used by the `wasm-wasi-component` module | 48.0.7 | none published | `src/wasm-wasi-component/Cargo.lock`, audited by the `Audit (cargo)` workflow on every lock. Bumped with the advisories it closes. |
 
 ## Rules
 
@@ -113,9 +113,10 @@ needs an upgrade or replacement decision instead.
   EOL + grace policy; they track what FreeUnit builds and bundles, not what it ships
   as a variant.
 - **A dependency pinned twice needs both rows.** Wasmtime is pinned once as a Rust
-  crate and once as a source tarball, and only the crate is reachable by `cargo
-  audit`. List every pin separately and say which one an automated check covers, so
-  a gap between them is visible here rather than only in a lock file.
+  crate and once as a source tarball. The `Audit (cargo)` workflow checks tracked
+  locks and checks the source pin plus its archived lock after verifying the
+  tarball checksum. List every pin separately and say which automated check covers
+  it, so a gap is visible here rather than only in a lock file.
 - **LTS OS (Ubuntu, RHEL, Debian):** 3-year extension applies to standard EOL, not
   extended security maintenance dates.
 
