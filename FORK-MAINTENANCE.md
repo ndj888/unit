@@ -71,6 +71,9 @@ git merge --no-commit --no-ff 'freeunit/X.Y.Z^{commit}'
 
 - Codex 的沙箱禁止创建 POSIX 共享内存，在沙箱里 `./configure` 会报 "no shared memory implementation found"。编译和测试要在沙箱外运行，由 Claude 验收时执行。
 - 跨版本构建前先清掉 `build/`：旧的依赖文件会引用已经删除的源文件，比如 1.37.0 删掉了 `src/nxt_fiber.h`。
+- 同步 PR 上 `Lint (Whitespace)` 一定会失败：它对 PR 里的每个提交运行 `git log --check`，会检查到合并进来的上游中间提交。判断标准改为 `git diff --check 'freeunit/X.Y.Z^{commit}' HEAD` 为空，也就是我们自己没有引入新的空白问题。
+- 新建的 PR 有时不会触发 `pull_request` workflow（1.37.0 时遇到过，Actions 里的运行记录为 0）。关闭再重新打开 PR 就会触发。
+- 发布要用到的凭据：推送用 SSH（`git@github.com:ndj888/unit.git`）；`gh` 的 token 需要对 ndj888/unit 有 Contents、Pull requests、Workflows 的写权限和 Actions 的读权限，否则创建 Release、编辑 PR、读取 CI 日志都会返回 403。
 - 如果 FreeUnit 的 tag 之后在 master 上又修了严重问题（比如 1.37.0 的 #595），用 `git cherry-pick -x <sha>` 移植，记进第 1 节的表格，CHANGES 条目写明 "Backported … from FreeUnit master"。
 
 然后用 `/codex-do` 交给 Codex。任务说明可以参照 1.37.0 那份，验收标准至少包括：
