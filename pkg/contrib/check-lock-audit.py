@@ -15,6 +15,8 @@ versions and nothing else.
 So this script splits the report in two.  A finding against a crate that the C
 API links fails the job unless the allowlist accepts that exact version with a
 reason.  A finding outside the linked graph is reported and does not fail.
+Acceptances are scoped to the reviewed Wasmtime version and archive SHA512.
+The audit workflow verifies that digest before extracting the source tree.
 
 The linked graph is computed, never declared: `cargo tree` resolves it offline
 against the vendored archive, with the feature set that pkg/contrib builds.  A
@@ -34,6 +36,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 MAKEFILE = REPO / "pkg/contrib/src/wasmtime/Makefile"
 ALLOWLIST = REPO / "pkg/contrib/wasmtime-lock-audit.allow.json"
+PIN_VERSION = REPO / "pkg/contrib/src/wasmtime/version"
+PIN_SHA512SUMS = REPO / "pkg/contrib/src/wasmtime/SHA512SUMS"
 FEATURES_CMAKE = Path("crates/c-api/cmake/features.cmake")
 CMAKELISTS = Path("crates/c-api/CMakeLists.txt")
 
@@ -191,6 +195,45 @@ def read_findings(report: Path) -> list:
     return findings
 
 
+def check_reviewed_pin(data: dict, path: Path) -> None:
+    """Reject acceptances unless they cover the current verified source pin."""
+    scope = data.get("reviewed_pin") if isinstance(data, dict) else None
+    if not isinstance(scope, dict):
+        fail(f"{path} needs a reviewed_pin scope")
+    version = scope.get("version")
+    digest = scope.get("archive_sha512")
+    if not isinstance(version, str) or not re.fullmatch(
+        r"[0-9]+\.[0-9]+\.[0-9]+", version
+    ):
+        fail(f"{path} has an invalid reviewed_pin version")
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{128}", digest):
+        fail(f"{path} has an invalid reviewed_pin archive_sha512")
+
+    try:
+        version_text = PIN_VERSION.read_text().strip()
+        checksums = PIN_SHA512SUMS.read_text().splitlines()
+    except OSError as error:
+        fail(f"cannot read Wasmtime source pin: {error}")
+
+    match = re.fullmatch(r"WASMTIME_VERSION := ([0-9]+\.[0-9]+\.[0-9]+)", version_text)
+    if not match:
+        fail(f"{rel(PIN_VERSION)} has an invalid Wasmtime version")
+    current_version = match.group(1)
+    archive = f"wasmtime-v{current_version}-src.tar.gz"
+    rows = [row for line in checksums if (row := line.split()) and row[-1] == archive]
+    if (
+        len(rows) != 1
+        or len(rows[0]) != 2
+        or not re.fullmatch(r"[0-9a-f]{128}", rows[0][0])
+    ):
+        fail(f"{rel(PIN_SHA512SUMS)} needs one valid SHA512 for {archive}")
+    if version != current_version or digest != rows[0][0]:
+        fail(
+            f"{path} reviewed_pin does not match the Wasmtime source pin; "
+            "review acceptances"
+        )
+
+
 def read_allowlist(path: Path) -> dict:
     try:
         data = json.loads(path.read_text())
@@ -198,6 +241,8 @@ def read_allowlist(path: Path) -> dict:
         fail(f"cannot read {path}: {error}")
     except json.JSONDecodeError as error:
         fail(f"{path} is not valid JSON: {error}")
+
+    check_reviewed_pin(data, path)
 
     allowed = {}
     for entry in data.get("allow", []):

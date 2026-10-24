@@ -22,7 +22,10 @@ anyhow v1.0.100
 wasmtime v47.0.4 (/src/crates/wasmtime)
 """
 
+PIN = {"version": "48.0.7", "archive_sha512": "a" * 128}
+
 ALLOW = {
+    "reviewed_pin": PIN,
     "allow": [
         {
             "kind": "vulnerability",
@@ -75,7 +78,27 @@ BASELINE = report(
 
 @pytest.fixture
 def run(tmp_path):
-    def call(report_text, allow=ALLOW, linked_text=LINKED):
+    # Exercise the CLI against isolated repository pin files, never changing
+    # the shared checkout when simulating a new archive.
+    script = tmp_path / "pkg/contrib/check-lock-audit.py"
+    script.parent.mkdir(parents=True)
+    script.write_text(SCRIPT.read_text())
+    pin_dir = script.parent / "src/wasmtime"
+    pin_dir.mkdir(parents=True)
+
+    def call(
+        report_text,
+        allow=ALLOW,
+        linked_text=LINKED,
+        pin_version=PIN["version"],
+        pin_sha512=PIN["archive_sha512"],
+    ):
+        if pin_version is not None:
+            (pin_dir / "version").write_text(f"WASMTIME_VERSION := {pin_version}\n")
+        if pin_sha512 is not None:
+            (pin_dir / "SHA512SUMS").write_text(
+                f"{pin_sha512}  wasmtime-v{pin_version}-src.tar.gz\n"
+            )
         linked = tmp_path / "linked.txt"
         linked.write_text(linked_text)
         report_file = tmp_path / "audit.json"
@@ -86,7 +109,7 @@ def run(tmp_path):
         return subprocess.run(
             [
                 sys.executable,
-                str(SCRIPT),
+                str(script),
                 "--report",
                 str(report_file),
                 "--linked",
@@ -106,6 +129,66 @@ def test_allowlisted_findings_pass(run):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "accepted:   crossbeam-epoch 0.9.18" in result.stdout
     assert "accepted:   chacha20 0.10.0: yanked" in result.stdout
+
+
+def test_changed_wasmtime_version_rejects_unchanged_crate_acceptances(run):
+    result = run(json.dumps(BASELINE), pin_version="48.0.8")
+    assert result.returncode == 2
+    assert "reviewed_pin does not match" in result.stderr
+    assert "accepted:" not in result.stdout
+
+
+def test_changed_same_version_archive_rejects_acceptances(run):
+    result = run(json.dumps(BASELINE), pin_sha512="b" * 128)
+    assert result.returncode == 2
+    assert "reviewed_pin does not match" in result.stderr
+    assert "accepted:" not in result.stdout
+
+
+def test_missing_reviewed_pin_fails(run):
+    result = run(json.dumps(BASELINE), {"allow": ALLOW["allow"]})
+    assert result.returncode == 2
+    assert "needs a reviewed_pin scope" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        None,
+        [],
+        "48.0.7",
+        {},
+        {"version": "48.0.7"},
+        {"archive_sha512": "a" * 128},
+        dict(PIN, version=None),
+        dict(PIN, version=48),
+        dict(PIN, version="48.0.7\n"),
+        dict(PIN, archive_sha512=None),
+        dict(PIN, archive_sha512=123),
+        dict(PIN, archive_sha512="a" * 127),
+        dict(PIN, archive_sha512="z" * 128),
+    ],
+)
+def test_invalid_reviewed_pin_fails(run, scope):
+    result = run(json.dumps(BASELINE), dict(ALLOW, reviewed_pin=scope))
+    assert result.returncode == 2
+    assert "reviewed_pin" in result.stderr
+    assert "accepted:" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "pin",
+    [
+        {"pin_version": None},
+        {"pin_version": "invalid"},
+        {"pin_sha512": None},
+        {"pin_sha512": "invalid"},
+    ],
+)
+def test_missing_or_invalid_source_pin_fails(run, pin):
+    result = run(json.dumps(BASELINE), **pin)
+    assert result.returncode == 2
+    assert "accepted:" not in result.stdout
 
 
 def test_unlinked_finding_is_reported_but_passes(run):
@@ -197,7 +280,10 @@ def test_a_missing_report_fails(run):
 
 
 def test_an_allowlist_entry_needs_a_reason(run):
-    allow = {"allow": [{"kind": "yanked", "package": "chacha20", "version": "0.10.0"}]}
+    allow = dict(
+        ALLOW,
+        allow=[{"kind": "yanked", "package": "chacha20", "version": "0.10.0"}],
+    )
     result = run(json.dumps(BASELINE), allow)
     assert result.returncode == 2
     assert "without reason" in result.stderr
@@ -208,6 +294,27 @@ def module():
     loaded = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(loaded)
     return loaded
+
+
+def test_committed_allowlist_matches_current_source_pin():
+    check = module()
+    assert check.read_allowlist(check.ALLOWLIST)
+
+
+@pytest.mark.parametrize("shape", ["missing", "duplicate", "extra-fields"])
+def test_source_checksum_must_identify_one_archive(tmp_path, monkeypatch, shape):
+    check = module()
+    sums = tmp_path / "SHA512SUMS"
+    monkeypatch.setattr(check, "PIN_SHA512SUMS", sums)
+    original = (SCRIPT.parent / "src/wasmtime/SHA512SUMS").read_text()
+    sums.write_text({
+        "missing": "",
+        "duplicate": original + original,
+        "extra-fields": "unexpected " + original,
+    }[shape])
+    with pytest.raises(SystemExit) as error:
+        check.read_allowlist(check.ALLOWLIST)
+    assert error.value.code == 2
 
 
 def archive(tmp_path, check, features_cmake):
@@ -310,7 +417,7 @@ def test_a_duplicate_allowlist_entry_fails(run):
         "version": "0.10.0",
         "reason": "first",
     }
-    allow = {"allow": [entry, dict(entry, reason="second")]}
+    allow = dict(ALLOW, allow=[entry, dict(entry, reason="second")])
     result = run(json.dumps(BASELINE), allow)
     assert result.returncode == 2
     assert "twice" in result.stderr
@@ -326,6 +433,7 @@ def test_a_warning_without_a_package_fails(run):
 def test_stale_entries_sort_with_and_without_an_advisory_id(run):
     # Sorting the stale list used to compare None against a string.
     allow = {
+        "reviewed_pin": PIN,
         "allow": [
             {
                 "kind": "yanked",

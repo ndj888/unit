@@ -4,9 +4,14 @@
     "pkg/contrib cannot resolve by bumping the pin.  check-lock-audit.py fails",
     "the audit on any other linked finding.  A finding outside the linked graph",
     "needs no entry here; it is reported and ignored.",
-    "The version is part of the key, so a pin bump forces this file to be",
-    "reviewed again rather than carrying an acceptance forward silently."
+    "Each entry matches an exact crate version. The reviewed_pin version and",
+    "archive SHA512 must also match the source pin, so any source change forces",
+    "review rather than carrying an acceptance forward silently."
   ],
+  "reviewed_pin": {
+    "version": "48.0.7",
+    "archive_sha512": "e4ee14a34e7939a8e887a03c0ac91bc4dc49b64ebb48d42987a58e03b9b1d6f46fa53a3251c06ff59c4736e96a7f40eaa4af0f38dac1befd04100cb213bf882b"
+  },
   "allow": [
     {
       "kind": "yanked",

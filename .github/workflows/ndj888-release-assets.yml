@@ -43,6 +43,7 @@ jobs:
           apt-get install -y --no-install-recommends git ca-certificates
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        id: checkout
         with:
           # An empty ref keeps checkout's default PR merge ref.
           ref: ${{ github.event_name != 'pull_request' && format('refs/tags/{0}', github.event.release.tag_name || inputs.tag) || '' }}
@@ -60,11 +61,23 @@ jobs:
 
       - name: Build, test, and package
         env:
+          CHECKOUT_COMMIT: ${{ steps.checkout.outputs.commit }}
           BUILD_TAG: ${{ github.event.release.tag_name || inputs.tag || '' }}
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
+          if [[ ! "$CHECKOUT_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'Checkout must report a full 40-character commit SHA.\n' >&2
+            exit 1
+          fi
+          # Container steps can use a different HOME from checkout's safe.directory setup.
+          # Trust only this workspace for this command; keep Git failure separate from printf.
+          git_commit="$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse --verify 'HEAD^{commit}')"
+          if [[ ! "$git_commit" =~ ^[0-9a-f]{40}$ || "$git_commit" != "$CHECKOUT_COMMIT" ]]; then
+            printf 'Git HEAD must be a full SHA matching the checkout commit.\n' >&2
+            exit 1
+          fi
           . ./version
           version="$NXT_VERSION"
           if [[ "$EVENT_NAME" == pull_request ]]; then
@@ -141,7 +154,7 @@ jobs:
           cp LICENSE NOTICE CHANGES "$package_dir/"
           {
             printf 'Tag: %s\n' "$build_identity"
-            printf 'Commit: %s\n' "$(git rev-parse HEAD)"
+            printf 'Commit: %s\n' "$CHECKOUT_COMMIT"
             printf 'Built at (UTC): %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             printf 'Base image: debian:trixie\n'
             gcc --version | sed -n '1p'
@@ -193,4 +206,4 @@ jobs:
           set -euo pipefail
           gh release view "$BUILD_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null
           gh release upload "$BUILD_TAG" dist/*.tar.gz dist/*.tar.gz.sha256 \
-            --clobber --repo "$GITHUB_REPOSITORY"
+            --repo "$GITHUB_REPOSITORY"
