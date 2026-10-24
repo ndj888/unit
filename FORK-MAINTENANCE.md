@@ -22,6 +22,13 @@
   | 85a8d49c | 让 C 测试能在 macOS 上编译运行，并新增 `build-test-macos.yml` | 同上，本地 macOS 验收需要 |
   | 872bf041 | macOS 上统计 shm 映射数量的测试 | 同上 |
 
+- **领先 FreeUnit 的依赖升级**（1.37.0 发布后才公布的 RustSec 公告，FreeUnit master 截至 2026-10-24 还没跟进）：
+  wasmtime 48.0.5 → 48.0.7、tokio → 1.54.1、rustls → 0.23.46、rustls-webpki → 0.103.16、webpki-roots → 1.0.10。
+  contrib 的 wasmtime 源码包改为从官方 GitHub release 下载（`pkg/contrib/src/wasmtime/Makefile`、`audit.yml`），
+  因为 FreeUnit 的镜像 `packages.freeunit.org` 上没有 48.0.7。
+  `pkg/contrib/wasmtime-lock-audit.allow.json` 中 tokio 1.51.1（RUSTSEC-2026-0386，属于 unsound 类）的例外只适用于 48.0.7 的 vendored 锁文件，下次升级 wasmtime 时必须复审。
+  同步 FreeUnit 时，这些文件很可能冲突：取两边中**较新**的版本，并重新运行 `cargo audit`。
+
 - **分支适配文件**（每次同步都要保留）：`README.md` 顶部的 "About this fork"、`SECURITY.md` 顶部一节、
   4 个 workflow 中的 `if: github.repository == 'freeunitorg/freeunit'` 防护
   （`release-docker.yml` 的 setup、`build-deb.yml` 的 release、`unitctl.yml` 的 release、`claude.yml`），
@@ -107,6 +114,8 @@ trivy fs --scanners vuln .
 - [ ] 把 `UNIT_REWRITTEN_PATH` 补丁提交到 FreeUnit 上游。被接受后，本分支就只剩同步和发布。
 - [ ] njs 升级到 1.0.2 或更高版本（`pkg/contrib/src/njs/version`，目前是 1.0.1）。CVE-2026-101025 和 CVE-2026-78689 都在 njs 的 XML 模块里，而 contrib 构建 njs 时用了 `--no-libxml2`，所以目前不受影响；等 FreeUnit 升级后随同步一起更新即可。
 - [ ] FreeUnit 发布 1.37.1 后同步，第 1 节表格里的 3 个移植提交会被它覆盖。
+- [ ] macOS 已知问题（旧问题，1.36.0 就有）：应用向一个已满的 AF_UNIX 数据报 socket 发消息时，macOS 返回 `ENOBUFS`，Linux 返回 `EAGAIN`。libunit 把 `ENOBUFS` 当成错误，大请求体的 Python 应用（`test_python_application_input_readlines_huge`）会卡住。Linux 不受影响。FreeUnit master 的 05b18e7d 只在非阻塞的唤醒消息上处理了 `ENOBUFS`。等 FreeUnit 下一版发布后复测；如果仍然存在，就向 FreeUnit 报告，并附上这个复现用例。
+- [ ] macOS 已知问题（1.37.0 发现，尚未定位）：`test_python_compression_concurrent_streams[zstd]` 在 macOS arm64 上 24 个响应全部超时；gzip 和 deflate 正常，Linux CI 的 python 3.12/3.13/3.14 全部通过。卡住时用 `sample <应用 pid>` 抓栈，可以看到应用的 32 个线程一部分在 libunit 的互斥锁上等待，一部分在 `take_gil` 里等待，疑似 GIL 和 libunit 锁的顺序问题在 macOS 上被触发。复现命令：`pytest test/test_python_compression.py -k "concurrent_streams and zstd"`。确认原因后向 FreeUnit 报告。
 - [ ] 跟踪 FreeUnit 尚未关闭的安全问题：freeunitorg/freeunit#343（没有完成的分片消息会一直占着文件描述符，1.37.0 已把每个 port 的上限设为 64 个）。
 - [ ] 复核 1.36.0 时记下的上游问题在 FreeUnit 里的状态：nginx/unit#1626（流式响应下的 `limits.timeout`，FreeUnit 1.37.0 已部分修改相关逻辑）、#1653（macOS 上 Python ASGI 段错误）、#1370（RHEL 8/9 Python 包）。
 - [ ] 名称与商标："NGINX" 是 F5 的商标。建议以后的 Release 标题用 "Unit (ndj888 build)" 之类的名称，避免看起来像官方发布。
