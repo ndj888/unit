@@ -114,8 +114,8 @@ trivy fs --scanners vuln .
 
 ## 6. 待办
 
-- [ ] 把 `UNIT_REWRITTEN_PATH` 补丁提交到 FreeUnit：已按 FreeUnit master 的新结构重写（分支 `fu/php-unit-rewritten-path`，提交 41962207），内部 CI 通过（ndj888/unit#2，php-8.3/8.4/8.5 全部通过）。PR 正文已确认，存于 `docs/upstream/pr-php.md`，**尚未提交**。在网页上打开 `https://github.com/freeunitorg/freeunit/compare/master...ndj888:unit:fu/php-unit-rewritten-path?expand=1`，粘贴正文即可提交。
-- [ ] njs 升级到 1.0.2：issue 正文已确认，存于 `docs/upstream/issue-njs-1.0.2.md`，**尚未提交**。默认构建用了 `--no-libxml2`，不受 XML 相关 CVE 影响；但 1.0.2 修复了 njs 引擎的多处内存安全问题，值得升级。
+- [x] `UNIT_REWRITTEN_PATH` 补丁已提交到上游：freeunitorg/freeunit#829（2026-10-26）。它基于 FreeUnit master 69de66ac，分支 `fu/php-unit-rewritten-path`，提交 4110b29e，作者署名 ndj888，正文见 `docs/upstream/pr-php.md`。等待维护者审查；被合并后，本分支就不再有自有补丁。
+- [x] njs 1.0.2 的升级建议已提交到上游：freeunitorg/freeunit#828（2026-10-26），正文见 `docs/upstream/issue-njs-1.0.2.md`。FreeUnit 升级后，随同步一起更新。
 - [x] 依赖升级已被上游合并：freeunitorg/freeunit#825（由 #815 rebase 而来，作者署名仍是 ndj888），与 dependabot 的 #814 互补；wasmtime 48.0.7 的源码包已上传到镜像。
 - [ ] FreeUnit 发布 1.37.1 后同步，第 1 节表格里的 3 个移植提交会被它覆盖。
 - [x] macOS 的两个已知问题（ENOBUFS 卡住、zstd 并发超时）：2026-10-24 在 FreeUnit master（4beef78f）上用 pytest 各跑 3 次都通过，说明上游已经修复，只是还没发版。同步 1.37.1 后即可解决，不需要上报。
