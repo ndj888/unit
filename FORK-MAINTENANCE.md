@@ -22,12 +22,12 @@
   | 85a8d49c | 让 C 测试能在 macOS 上编译运行，并新增 `build-test-macos.yml` | 同上，本地 macOS 验收需要 |
   | 872bf041 | macOS 上统计 shm 映射数量的测试 | 同上 |
 
-- **领先 FreeUnit 的依赖升级**（1.37.0 发布后才公布的 RustSec 公告，FreeUnit master 截至 2026-10-24 还没跟进）：
+- **领先 FreeUnit 1.37.0 的依赖升级**（都是 1.37.0 发布之后才公布的 RustSec 公告）：
   wasmtime 48.0.5 → 48.0.7、tokio → 1.54.1、rustls → 0.23.46、rustls-webpki → 0.103.16、webpki-roots → 1.0.10。
-  contrib 的 wasmtime 源码包改为从官方 GitHub release 下载（`pkg/contrib/src/wasmtime/Makefile`、`audit.yml`），
-  因为 FreeUnit 的镜像 `packages.freeunit.org` 上没有 48.0.7。
-  `pkg/contrib/wasmtime-lock-audit.allow.json` 中 tokio 1.51.1（RUSTSEC-2026-0386，属于 unsound 类）的例外只适用于 48.0.7 的 vendored 锁文件，下次升级 wasmtime 时必须复审。
-  同步 FreeUnit 时，这些文件很可能冲突：取两边中**较新**的版本，并重新运行 `cargo audit`。
+  上游已全部跟进，下一个 FreeUnit 版本会自带这些升级：wasmtime 和 webpki 两项是本分支提交、作者署名为 ndj888 的 freeunitorg/freeunit#825（提交 73d34155，原 PR #815 rebase 后合并）；tokio 和 rustls 来自 dependabot 的 #814。
+  wasmtime 48.0.7 的源码包已经上传到 `packages.freeunit.org`。本分支曾因镜像缺这个文件，把 contrib 的下载地址改成了 GitHub（`pkg/contrib/src/wasmtime/Makefile`、`audit.yml`）。**下次同步时请改回上游的镜像地址**，减少和上游的差异。
+  `pkg/contrib/wasmtime-lock-audit.allow.json` 里 tokio 1.51.1（RUSTSEC-2026-0386，属于 unsound 类）的例外，在本分支由 `reviewed_pin` 绑定到 48.0.7 的版本号和 SHA512。
+  同步 FreeUnit 时这些文件很可能冲突：版本号取两边**较新**的，保留本分支的 `reviewed_pin` 校验，然后重新运行 `cargo audit`。
 
 - **分支适配文件**（每次同步都要保留）：`README.md` 顶部的 "About this fork"、`SECURITY.md` 顶部一节、
   4 个 workflow 中的 `if: github.repository == 'freeunitorg/freeunit'` 防护
@@ -116,7 +116,7 @@ trivy fs --scanners vuln .
 
 - [ ] 把 `UNIT_REWRITTEN_PATH` 补丁提交到 FreeUnit：已按 FreeUnit master 的新结构重写（分支 `fu/php-unit-rewritten-path`，提交 41962207），内部 CI 通过（ndj888/unit#2，php-8.3/8.4/8.5 全部通过）。PR 正文已确认，存于 `docs/upstream/pr-php.md`，**尚未提交**。在网页上打开 `https://github.com/freeunitorg/freeunit/compare/master...ndj888:unit:fu/php-unit-rewritten-path?expand=1`，粘贴正文即可提交。
 - [ ] njs 升级到 1.0.2：issue 正文已确认，存于 `docs/upstream/issue-njs-1.0.2.md`，**尚未提交**。默认构建用了 `--no-libxml2`，不受 XML 相关 CVE 影响；但 1.0.2 修复了 njs 引擎的多处内存安全问题，值得升级。
-- [x] 依赖升级已提交上游：freeunitorg/freeunit#815（wasmtime 48.0.7、rustls-webpki、webpki-roots），与 dependabot 的 #814（tokio、rustls）互补，两者叠加后 8 个锁文件的审计全部通过。合并前需要 FreeUnit 维护者把 `wasmtime-v48.0.7-src.tar.gz` 上传到 packages.freeunit.org。
+- [x] 依赖升级已被上游合并：freeunitorg/freeunit#825（由 #815 rebase 而来，作者署名仍是 ndj888），与 dependabot 的 #814 互补；wasmtime 48.0.7 的源码包已上传到镜像。
 - [ ] FreeUnit 发布 1.37.1 后同步，第 1 节表格里的 3 个移植提交会被它覆盖。
 - [x] macOS 的两个已知问题（ENOBUFS 卡住、zstd 并发超时）：2026-10-24 在 FreeUnit master（4beef78f）上用 pytest 各跑 3 次都通过，说明上游已经修复，只是还没发版。同步 1.37.1 后即可解决，不需要上报。
 - [ ] 跟踪 FreeUnit 尚未关闭的安全问题：freeunitorg/freeunit#343（没有完成的分片消息会一直占着文件描述符，1.37.0 已把每个 port 的上限设为 64 个）。
@@ -124,6 +124,15 @@ trivy fs --scanners vuln .
 - [ ] 向上游提交 PR 或 issue 时，fine-grained token 不行：它只能授权给自己名下的仓库，对 freeunitorg 一律返回 403。可以用 classic token（`repo` + `read:org`），或者直接在网页上提交。
 - [ ] 名称与商标："NGINX" 是 F5 的商标。建议以后的 Release 标题用 "Unit (ndj888 build)" 之类的名称，避免看起来像官方发布。
 - [ ] 视需要补 Docker 镜像发布：上游的 `release-docker.yml` 已在本仓库禁用，需要时另写一个推送到 `ghcr.io/ndj888/unit` 的 workflow。
+
+- [ ] 生产镜像目前无法从零重建：us-df-v2 上的 `nc-unit:php-8.5.12-unit-1.37.0-20261024` 以本地镜像 `nc-unit:php-8.5.12-security-20261021` 为基础（`nc-docker/unit-1.37.0/Dockerfile.unit-1.37.0`），后者原来的构建目录已经丢失。下次 PHP 出安全更新之前，需要补一份从 `php:8.5` 官方镜像开始的完整 Dockerfile。
+- [ ] 每周一的 `audit.yml` 和 `eol-check.yml` 会在本仓库 master 上自动运行，要定期查看结果，或者留意它们自动开的 issue。
+
+## 6.1 生产部署记录
+
+- 2026-10-24：us-df-v2 上的 Nextcloud app 容器从 Unit 1.35.0 切换到 1.37.0（ndj888 构建 efd3dbe2，PHP 8.5.12）。新镜像只替换了 `unitd` 和 `php.unit.so`，编译参数与原镜像相同。切换前先用测试容器确认 1.37.0 能导入 `unit-config/nextcloud-unit.json`；切换时只重建 app 容器（`docker compose up -d --no-deps app`），中断约 30 秒。
+- 回滚：`cd ~/docker/nextcloud && cp -p docker-compose.yaml.bak-unit137-20261024 docker-compose.yaml && docker compose up -d --no-deps app`。旧镜像另有 tag `nc-unit:php-8.5.12-rollback-20261024`。
+- 注意：Unit 的状态目录没有挂载卷，每次重建容器都会重新导入 `nextcloud-unit.json`，所以升级 Unit 之前一定要先用测试容器验证这份配置能被新版本接受。服务器上没有 buildx，构建时要设置 `DOCKER_BUILDKIT=0`。
 
 ## 7. 1.37.0 升级须知（相对官方 1.35.0 和 ndj888 1.36.0 的行为变化）
 
