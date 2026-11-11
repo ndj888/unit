@@ -1,0 +1,392 @@
+name: Verify request-target spaces
+
+on:
+  push:
+    branches: [codex/verify-request-target-spaces]
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_SHA: 6099d6bc2a0e02ead72c859811fa4e42bb3aa0d8
+  BASELINE_SHA: fb8cd508da26dcf071b039631b70305bd3862de2
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  functional:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    container:
+      image: debian:trixie
+      options: --privileged
+    steps:
+      - name: Install tools inside Docker
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          printf 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-ci-bounds
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates build-essential which \
+            libssl-dev openssl libpcre2-dev zlib1g-dev libzstd-dev libbrotli-dev \
+            python3-dev python3-pytest python3-openssl python3-packaging python3-venv \
+            procps iproute2 curl pkg-config
+      - uses: actions/checkout@v7
+        with:
+          repository: ndj888/unit
+          ref: 6099d6bc2a0e02ead72c859811fa4e42bb3aa0d8
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Assert exact source and record coverage
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD^1)" = "$BASELINE_SHA"
+          {
+            git log -1 --format=fuller
+            git status --short
+            printf '\nBaseline parser: %s\n' "$BASELINE_SHA"
+            printf 'Coverage: C core, OpenSSL, zlib/zstd/brotli, Python, ASGI, routing/static and raw sockets.\n'
+            printf 'No njs, otel or other language modules; optional tests may skip and are retained in JUnit.\n'
+            gcc --version
+            python3 --version
+            pytest-3 --version
+          } 2>&1 | tee artifacts/provenance.log
+      - name: Build fixed core, C tests and Python module
+        run: |
+          set -euo pipefail
+          ./configure --openssl --zlib --zstd --brotli --tests 2>&1 | tee artifacts/configure.log
+          make -j4 2>&1 | tee artifacts/build.log
+          make -j4 build/lib/libunit.a tests 2>&1 | tee artifacts/build-tests.log
+          ./configure python --config=python3-config 2>&1 | tee artifacts/configure-python.log
+          make -j4 python3 2>&1 | tee artifacts/build-python.log
+      - name: Run fixed full C suite and libunit tests
+        run: |
+          set -euo pipefail
+          .github/scripts/check-test-hooks.sh 2>&1 | tee artifacts/test-hooks.log
+          ./build/tests 2>&1 | tee artifacts/c-tests-initial.log
+          ./build/unit_close_test 2>&1 | tee artifacts/unit-close.log
+          ./build/unit_port_recv_test 2>&1 | tee artifacts/unit-port-recv.log
+          ./build/unit_msg_test 2>&1 | tee artifacts/unit-msg.log
+      - name: Prove the baseline parser fails the new tests
+        timeout-minutes: 7
+        run: |
+          set -euo pipefail
+          trap 'git restore --source="$SOURCE_SHA" -- src/nxt_http_parse.c' EXIT
+          git show "$BASELINE_SHA:src/nxt_http_parse.c" > src/nxt_http_parse.c
+          test "$(git hash-object src/nxt_http_parse.c)" = "$(git rev-parse "$BASELINE_SHA:src/nxt_http_parse.c")"
+          make -j4 unitd tests 2>&1 | tee artifacts/baseline-build.log
+          set +e
+          ./build/tests > artifacts/baseline-c-tests.log 2>&1
+          c_rc=$?
+          set -e
+          cat artifacts/baseline-c-tests.log
+          test "$c_rc" -ne 0
+          grep -F 'http parse test case failed' artifacts/baseline-c-tests.log
+          printf 'Expected failing baseline C exit: %s\n' "$c_rc" | tee artifacts/baseline-c-exit.log
+          set +e
+          pytest-3 --print-log -ra --port 18080 \
+            --junitxml=artifacts/baseline-raw-space.xml \
+            test/test_http_request_target.py -k raw_space \
+            > artifacts/baseline-raw-space.log 2>&1
+          pytest_rc=$?
+          set -e
+          cat artifacts/baseline-raw-space.log
+          test "$pytest_rc" -eq 1
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          cases = ET.parse('artifacts/baseline-raw-space.xml').getroot().findall('.//testcase')
+          assert len(cases) == 16, f'expected 16 baseline cases, got {len(cases)}'
+          for case in cases:
+              assert case.attrib['name'].startswith('test_http_request_target_raw_space['), case.attrib
+              assert case.find('error') is None, ET.tostring(case, encoding='unicode')
+              assert case.find('skipped') is None, ET.tostring(case, encoding='unicode')
+              failure = case.find('failure')
+              assert failure is not None, ET.tostring(case, encoding='unicode')
+              detail = ''.join(failure.itertext()) + failure.attrib.get('message', '')
+              assert 'AssertionError' in detail, detail
+              assert 'response.startswith' in detail or 'assert False' in detail, detail
+          print('Baseline negative control: all 16 raw-space cases failed in assertions, zero setup/collection errors or skips.')
+          PY
+      - name: Restore fixed parser and require all 18 socket cases to pass
+        run: |
+          set -euo pipefail
+          git diff --exit-code "$SOURCE_SHA" -- src/nxt_http_parse.c
+          make -j4 unitd tests python3 2>&1 | tee artifacts/fixed-rebuild.log
+          ./build/tests 2>&1 | tee artifacts/c-tests-fixed.log
+          pytest-3 --print-log -ra --port 18080 \
+            --junitxml=artifacts/fixed-request-target.xml \
+            test/test_http_request_target.py 2>&1 | tee artifacts/fixed-request-target.log
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          cases = ET.parse('artifacts/fixed-request-target.xml').getroot().findall('.//testcase')
+          assert len(cases) == 18, f'expected 18 fixed cases, got {len(cases)}'
+          for case in cases:
+              assert not any(case.find(kind) is not None for kind in ('failure', 'error', 'skipped')), ET.tostring(case, encoding='unicode')
+          assert sum(case.attrib['name'].startswith('test_http_request_target_raw_space[') for case in cases) == 16
+          assert sum(case.attrib['name'].startswith('test_http_request_target_encoded_space_keepalive[') for case in cases) == 2
+          print('Fixed positive control: all 18 socket cases passed, zero failures/errors/skips.')
+          PY
+      - name: Run affected Python files and HTTP routing/static regressions
+        timeout-minutes: 12
+        env:
+          TZ: Asia/Kolkata
+        run: |
+          set -euo pipefail
+          pytest-3 --print-log -ra --port 18080 \
+            --junitxml=artifacts/functional.xml \
+            test/test_http_request_target.py \
+            test/test_access_log.py test/test_asgi_application.py \
+            test/test_python_application.py test/test_routing.py test/test_static.py \
+            test/test_http_client_framing.py test/test_http_expect.py \
+            test/test_http_header.py test/test_http_no_body_status.py \
+            test/test_route_if.py test/test_routing_tls.py \
+            test/test_static_share.py test/test_static_fallback.py \
+            test/test_static_types.py test/test_static_variables.py \
+            test/test_static_compression.py \
+            2>&1 | tee artifacts/functional.log
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          cases = ET.parse('artifacts/functional.xml').getroot().findall('.//testcase')
+          passed = [c for c in cases if not any(c.find(k) is not None for k in ('failure', 'error', 'skipped'))]
+          for stem in ('test_http_request_target', 'test_access_log', 'test_asgi_application', 'test_python_application', 'test_routing', 'test_static'):
+              assert any(c.attrib.get('classname', '').split('.')[-1] == stem for c in passed), f'no passing cases in affected file {stem}'
+          print(f'Functional coverage: {len(passed)} passed; {sum(c.find("skipped") is not None for c in cases)} skipped.')
+          PY
+      - name: Run stored routing configuration with restart
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          pytest-3 --print-log -ra --restart --port 18080 \
+            --junitxml=artifacts/routing-restart.xml \
+            test/test_routing.py::test_routes_match_host_idn_stored \
+            2>&1 | tee artifacts/routing-restart.log
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          cases = ET.parse('artifacts/routing-restart.xml').getroot().findall('.//testcase')
+          assert len(cases) == 1
+          assert not any(cases[0].find(k) is not None for k in ('failure', 'error', 'skipped'))
+          PY
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: request-target-functional
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 7
+
+  strict:
+    name: Strict C (${{ matrix.cc }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    container:
+      image: debian:trixie
+      options: --privileged
+    steps:
+      - name: Install tools inside Docker
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          printf 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-ci-bounds
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates build-essential which \
+            clang libssl-dev libpcre2-dev libxml2-utils xsltproc
+      - uses: actions/checkout@v7
+        with:
+          repository: ndj888/unit
+          ref: 6099d6bc2a0e02ead72c859811fa4e42bb3aa0d8
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Assert exact source and compile strict core
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD^1)" = "$BASELINE_SHA"
+          git log -1 --format=fuller | tee artifacts/provenance.log
+          ${{ matrix.cc }} --version | tee artifacts/compiler.log
+          ./configure --cc=${{ matrix.cc }} --hardening=strict --tests --openssl \
+            2>&1 | tee artifacts/configure.log
+          grep -q 'hardening: .* strict$' artifacts/configure.log
+          for flag in -fstack-protector-strong -fstack-clash-protection \
+                      -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack \
+                      -Wformat=2 -Wvla -Wimplicit-fallthrough \
+                      -ftrivial-auto-var-init=pattern
+          do
+            grep -q "checking for $flag \.\.\. found" artifacts/configure.log \
+              || { echo "$flag was not found"; exit 1; }
+          done
+          grep -q 'checking for -D_FORTIFY_SOURCE=[23] \.\.\. found' artifacts/configure.log
+          grep -q 'define NXT_HAVE_BUILTIN_OVERFLOW' build/include/nxt_auto_config.h
+          make -j4 2>&1 | tee artifacts/build.log
+          make -j4 build/lib/libunit.a tests 2>&1 | tee artifacts/build-tests.log
+      - name: Run full C suite and hook isolation
+        run: |
+          set -euo pipefail
+          .github/scripts/check-test-hooks.sh 2>&1 | tee artifacts/test-hooks.log
+          ./build/tests 2>&1 | tee artifacts/c-tests.log
+          ./build/unit_close_test 2>&1 | tee artifacts/unit-close.log
+          ./build/unit_port_recv_test 2>&1 | tee artifacts/unit-port-recv.log
+          ./build/unit_msg_test 2>&1 | tee artifacts/unit-msg.log
+      - name: Check generated changelog
+        if: matrix.cc == 'gcc'
+        run: |
+          set -euo pipefail
+          if make -C docs check 2>&1 | tee artifacts/docs-check.log; then
+            git diff --exit-code -- CHANGES docs/changes.xml
+          else
+            docs_rc=$?
+            if [ -f build/CHANGES ]; then
+              cp build/CHANGES artifacts/generated-CHANGES
+              if diff -u CHANGES build/CHANGES | tee artifacts/docs-CHANGES.diff; then
+                :
+              else
+                diff_rc=$?
+                test "$diff_rc" -eq 1
+              fi
+            fi
+            exit "$docs_rc"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: request-target-strict-${{ matrix.cc }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 7
+
+  sanitizer:
+    name: ASan UBSan C (${{ matrix.cc }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    container:
+      image: debian:trixie
+      options: --privileged
+    steps:
+      - name: Install tools inside Docker
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          printf 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-ci-bounds
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates build-essential which \
+            clang libclang-rt-dev libssl-dev libpcre2-dev
+      - uses: actions/checkout@v7
+        with:
+          repository: ndj888/unit
+          ref: 6099d6bc2a0e02ead72c859811fa4e42bb3aa0d8
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Assert exact source and build sanitizer C suite
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD^1)" = "$BASELINE_SHA"
+          git log -1 --format=fuller | tee artifacts/provenance.log
+          ${{ matrix.cc }} --version | tee artifacts/compiler.log
+          ASAN_OPTIONS=detect_leaks=0 ./configure \
+            --cc=${{ matrix.cc }} --debug --tests --openssl \
+            --cc-opt='-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -O1 -g' \
+            --ld-opt='-fsanitize=address,undefined' 2>&1 | tee artifacts/configure.log
+          make -j4 2>&1 | tee artifacts/build.log
+          make -j4 build/lib/libunit.a tests 2>&1 | tee artifacts/build-tests.log
+          .github/scripts/check-test-hooks.sh 2>&1 | tee artifacts/test-hooks.log
+      - name: Run full C suite with leak and undefined behavior detection
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1
+        run: |
+          set -euo pipefail
+          ./build/tests 2>&1 | tee artifacts/c-tests.log
+      - name: Run standalone libunit tests with stack roots disabled
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1
+          LSAN_OPTIONS: use_stacks=0
+        run: |
+          set -euo pipefail
+          ./build/unit_close_test 2>&1 | tee artifacts/unit-close.log
+          ./build/unit_port_recv_test 2>&1 | tee artifacts/unit-port-recv.log
+          ./build/unit_msg_test 2>&1 | tee artifacts/unit-msg.log
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: request-target-sanitizer-${{ matrix.cc }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 7
+
+  clang-ast:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
+    container:
+      image: debian:testing
+      options: --privileged
+    steps:
+      - name: Install tools inside Docker
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          printf 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-ci-bounds
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates build-essential which \
+            llvm-dev libclang-dev clang libssl-dev libpcre2-dev python3-dev pkg-config
+      - uses: actions/checkout@v7
+        with:
+          repository: ndj888/unit
+          ref: 6099d6bc2a0e02ead72c859811fa4e42bb3aa0d8
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Assert exact source and build public clang-ast plugin
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD^1)" = "$BASELINE_SHA"
+          {
+            git log -1 --format=fuller
+            clang --version
+            printf 'AST coverage: C core and Python module; no otel, njs or other language modules.\n'
+          } 2>&1 | tee artifacts/provenance.log
+          git clone --depth 1 -b unit https://github.com/freeunitorg/clang-ast.git /tmp/clang-ast
+          git -C /tmp/clang-ast rev-parse HEAD | tee artifacts/plugin-sha.log
+          make -j4 -C /tmp/clang-ast 2>&1 | tee artifacts/plugin-build.log
+      - name: Compile and run C suite under clang-ast
+        run: |
+          set -euo pipefail
+          ./configure --cc=clang \
+            --cc-opt='-Xclang -load -Xclang /tmp/clang-ast/ngx-ast.so -Xclang -add-plugin -Xclang ngx-ast -Wno-default-const-init-field-unsafe' \
+            --openssl --debug --tests 2>&1 | tee artifacts/configure.log
+          make -j4 2>&1 | tee artifacts/build.log
+          make -j4 build/lib/libunit.a tests 2>&1 | tee artifacts/build-tests.log
+          .github/scripts/check-test-hooks.sh 2>&1 | tee artifacts/test-hooks.log
+          ./build/tests 2>&1 | tee artifacts/c-tests.log
+          ./build/unit_close_test 2>&1 | tee artifacts/unit-close.log
+          ./build/unit_port_recv_test 2>&1 | tee artifacts/unit-port-recv.log
+          ./build/unit_msg_test 2>&1 | tee artifacts/unit-msg.log
+          ./configure python --config=python3-config 2>&1 | tee artifacts/configure-python.log
+          make -j4 python3 2>&1 | tee artifacts/build-python.log
+          printf 'clang-ast C core and Python module check passed.\n' | tee artifacts/result.log
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: request-target-clang-ast
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 7
