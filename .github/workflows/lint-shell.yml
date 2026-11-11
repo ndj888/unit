@@ -11,7 +11,7 @@ on:
   pull_request:
     types: [ opened, synchronize, reopened ]
   push:
-    branches: [ master ]
+    branches: [ master, codex/develop ]
   merge_group:
 
 permissions:

@@ -13,7 +13,7 @@ name: "Alpine timing and word size"
 on:
   pull_request:
   push:
-    branches: [ master ]
+    branches: [ master, codex/develop ]
   schedule:
     - cron: '41 3 * * *'
   workflow_dispatch:

@@ -37,6 +37,7 @@ on:
     # pull_request trigger above.
     branches:
       - master
+      - codex/develop
       - 'pre-*'
     paths:
       - configure

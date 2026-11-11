@@ -33,7 +33,7 @@ on:
       - '.github/workflows/tsan.yml'
       - '.github/scripts/check-test-hooks.sh'
   push:
-    branches: [ master ]
+    branches: [ master, codex/develop ]
     paths:
       - configure
       - 'auto/**'

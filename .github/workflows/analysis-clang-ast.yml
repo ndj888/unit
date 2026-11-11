@@ -2,7 +2,7 @@ name: "Analysis (Clang AST)"
 
 on:
   push:
-    branches: master
+    branches: [ master, codex/develop ]
     paths:
       - configure
       - 'auto/**'
@@ -11,7 +11,7 @@ on:
       - 'pkg/contrib/**'
       - '.github/workflows/analysis-clang-ast.yml'
   pull_request:
-    branches: master
+    branches: [ master, codex/develop ]
     paths:
       - configure
       - 'auto/**'

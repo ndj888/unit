@@ -19,7 +19,7 @@ on:
       - '.github/scripts/check-rust-version.py'
       - '.github/workflows/rust-version.yml'
   push:
-    branches: master
+    branches: [ master, codex/develop ]
     paths:
       - '**/Cargo.toml'
       - '**/Cargo.lock'

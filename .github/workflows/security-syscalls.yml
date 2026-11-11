@@ -9,7 +9,7 @@ on:
       - 'test/syscalls/**'
       - '.github/workflows/security-syscalls.yml'
   push:
-    branches: master
+    branches: [ master, codex/develop ]
     paths:
       - configure
       - 'auto/**'

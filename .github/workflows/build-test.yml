@@ -14,7 +14,7 @@ on:
       - '.github/scripts/check-test-hooks.sh'
       - '.github/scripts/test-matrix.sh'
   push:
-    branches: master
+    branches: [ master, codex/develop ]
     paths:
       - configure
       - 'auto/**'

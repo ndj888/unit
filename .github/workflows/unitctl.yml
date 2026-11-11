@@ -14,6 +14,7 @@ on:
     # not evaluated for tag pushes, so a release tag always builds.
     branches:
       - master
+      - codex/develop
     paths:
       - tools/unitctl/**
       - docs/unit-openapi.yaml
