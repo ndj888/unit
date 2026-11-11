@@ -44,6 +44,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test "$(git rev-parse HEAD^1)" = "$BASELINE_SHA"
           {
@@ -210,6 +211,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test "$(git rev-parse HEAD^1)" = "$BASELINE_SHA"
           git log -1 --format=fuller | tee artifacts/provenance.log
@@ -295,6 +297,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test "$(git rev-parse HEAD^1)" = "$BASELINE_SHA"
           git log -1 --format=fuller | tee artifacts/provenance.log
@@ -357,6 +360,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test "$(git rev-parse HEAD^1)" = "$BASELINE_SHA"
           {
