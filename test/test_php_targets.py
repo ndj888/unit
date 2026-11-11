@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from unit.applications.lang.php import ApplicationPHP
@@ -300,3 +301,196 @@ def test_php_application_index_nul():
     assert 'success' in conf_notargets_index(
         "index.php"
     ), 'clean notargets index still accepted'
+
+
+def test_php_application_root_cwd(temp_dir):
+    # The working directory of a root-only target must follow the script:
+    # in the same directory, in another directory, and after a script that
+    # called chdir().
+    for d in ('a', 'b'):
+        Path(f'{temp_dir}/{d}').mkdir()
+        Path(f'{temp_dir}/{d}/cwd.php').write_text(
+            '<?php echo getcwd() . "|" . file_get_contents("rel.txt");',
+            encoding='utf-8',
+        )
+        Path(f'{temp_dir}/{d}/rel.txt').write_text(d, encoding='utf-8')
+        Path(f'{temp_dir}/{d}/chdir.php').write_text(
+            '<?php chdir("/"); echo getcwd();', encoding='utf-8'
+        )
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {"*:8080": {"pass": "applications/root"}},
+            "applications": {
+                "root": {
+                    "type": client.get_application_type(),
+                    "processes": 1,
+                    "root": temp_dir,
+                }
+            },
+        }
+    )
+
+    def check(d):
+        cwd = str(Path(f'{temp_dir}/{d}').resolve())
+        assert client.get(url=f'/{d}/cwd.php')['body'] == f'{cwd}|{d}', d
+
+    for d in ('a', 'a', 'b', 'b', 'a'):
+        check(d)
+
+    assert client.get(url='/a/chdir.php')['body'] == '/'
+    check('a')
+
+    assert client.get(url='/b/chdir.php')['body'] == '/'
+    check('b')
+    check('a')
+
+
+def test_php_application_root_cwd_after_script_chdir(temp_dir):
+    # A script of a root-only target changes into a subdirectory.  The next
+    # request for the same directory must run in the script directory, not
+    # in the subdirectory.  The same process must serve all requests, or
+    # a new process could pass the test without the restore.
+    app = Path(f'{temp_dir}/app')
+    (app / 'sub').mkdir(parents=True)
+    (app / 'cwd.php').write_text(
+        '<?php echo getmypid(), "|", getcwd(), "|", '
+        'file_get_contents("rel.txt");',
+        encoding='utf-8',
+    )
+    (app / 'chdir.php').write_text(
+        '<?php chdir("sub"); echo getmypid(), "|", getcwd();',
+        encoding='utf-8',
+    )
+    (app / 'rel.txt').write_text('app', encoding='utf-8')
+    (app / 'sub/rel.txt').write_text('sub', encoding='utf-8')
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {"*:8080": {"pass": "applications/root"}},
+            "applications": {
+                "root": {
+                    "type": client.get_application_type(),
+                    "processes": 1,
+                    "root": temp_dir,
+                }
+            },
+        }
+    )
+
+    cwd = str(app.resolve())
+
+    pid, body = client.get(url='/app/cwd.php')['body'].split('|', 1)
+    assert body == f'{cwd}|app', 'before chdir'
+
+    pid2, body = client.get(url='/app/chdir.php')['body'].split('|', 1)
+    assert pid2 == pid, 'same process after chdir'
+    assert body == f'{cwd}/sub', 'script chdir'
+
+    pid3, body = client.get(url='/app/cwd.php')['body'].split('|', 1)
+    assert pid3 == pid, 'same process after restore'
+    assert body == f'{cwd}|app', 'cwd restored'
+
+
+def test_php_application_root_symlink_swap(temp_dir):
+    # A deploy can replace a script directory at the same path, for example
+    # by a rename of a new symlink over the old one.  The next request must
+    # run in the new directory, not in the old one.  The symlink is below
+    # "root", because the module resolves "root" itself only at startup.
+    for d in ('A', 'B'):
+        Path(f'{temp_dir}/{d}').mkdir()
+        Path(f'{temp_dir}/{d}/cwd.php').write_text(
+            '<?php echo getcwd() . "|" . file_get_contents("rel.txt");',
+            encoding='utf-8',
+        )
+        Path(f'{temp_dir}/{d}/rel.txt').write_text(d, encoding='utf-8')
+
+    def check(d):
+        cwd = str(Path(f'{temp_dir}/{d}').resolve())
+        assert client.get(url='/current/cwd.php')['body'] == f'{cwd}|{d}', d
+
+    os.symlink(f'{temp_dir}/A', f'{temp_dir}/current')
+
+    try:
+        assert 'success' in client.conf(
+            {
+                "listeners": {"*:8080": {"pass": "applications/root"}},
+                "applications": {
+                    "root": {
+                        "type": client.get_application_type(),
+                        "processes": 1,
+                        "root": temp_dir,
+                    }
+                },
+            }
+        )
+
+        check('A')
+        check('A')
+
+        os.symlink(f'{temp_dir}/B', f'{temp_dir}/next')
+        os.rename(f'{temp_dir}/next', f'{temp_dir}/current')
+
+        check('B')
+        check('B')
+
+    finally:
+        # The temp_dir cleanup does not handle a symlink.
+        for link in ('current', 'next'):
+            if os.path.islink(f'{temp_dir}/{link}'):
+                os.unlink(f'{temp_dir}/{link}')
+
+
+def test_php_application_targets_cwd_renamed_dir(temp_dir):
+    # The script path is resolved when the configuration is loaded.  The
+    # module changed the directory only when the target differed from the
+    # one of the previous request.  When a new tree is renamed into place
+    # between two requests for the same target, the script is opened from
+    # the new tree, but the working directory stays on the old one.
+    # Relative includes and reads then use the old tree.
+    root = Path(f'{temp_dir}/root')
+    app = root / 'app'
+    app.mkdir(parents=True)
+
+    script = (
+        '<?php echo getmypid(), "\\n", getcwd(), "\\n", '
+        'file_get_contents("data.txt");'
+    )
+
+    (app / 'index.php').write_text(script, encoding='utf-8')
+    (app / 'data.txt').write_text('v1', encoding='utf-8')
+
+    assert 'success' in client.conf(
+        {
+            "listeners": {"*:8080": {"pass": "applications/targets/app"}},
+            "applications": {
+                "targets": {
+                    "type": client.get_application_type(),
+                    "processes": 1,
+                    "targets": {
+                        "app": {"root": str(root), "script": "app/index.php"},
+                    },
+                }
+            },
+        }
+    )
+
+    cwd = str(app.resolve())
+
+    pid, body = client.get()['body'].split('\n', 1)
+    assert body == f'{cwd}\nv1', 'old tree'
+
+    new = root / 'new'
+    new.mkdir()
+    (new / 'index.php').write_text(script, encoding='utf-8')
+    (new / 'data.txt').write_text('v2', encoding='utf-8')
+
+    app.rename(root / 'old')
+    new.rename(app)
+
+    # The same process must serve both requests.  A new process would
+    # change to the new tree at its first request, so the test would pass
+    # without the fix.
+    pid2, body = client.get()['body'].split('\n', 1)
+    assert pid2 == pid, 'same process'
+    assert body == f'{cwd}\nv2', 'new tree'

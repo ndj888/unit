@@ -8,7 +8,9 @@ import time
 import pytest
 
 from conftest import run_process
+from unit.option import option
 from unit.applications.proto import ApplicationProto
+from unit import port as port_map
 from unit.utils import waitforsocket
 
 client = ApplicationProto()
@@ -34,6 +36,13 @@ EXPORT_TIMEOUT = 20
 # interval, short enough to keep the suite snappy when nothing should arrive.
 SAMPLING_CHECK_TIMEOUT = 10
 
+# The gap between two writes of one request header, and the span duration
+# that proves the span started at the first write and not at the second.
+# The server may read the first write a little after the client sent it, so
+# the bound is below the gap.
+HEADER_GAP = 0.5
+HEADER_GAP_MIN_NS = 400_000_000
+
 # A 16-byte trace id / 8-byte span id used for the inheritance test.
 TRACE_ID = '0af7651916cd43dd8448eb211c80319c'
 PARENT_ID = 'b7ad6b7169203331'
@@ -45,8 +54,12 @@ def _get_free_port():
         return s.getsockname()[1]
 
 
-def _run_fake_otlp(port, requests=None, dump=None, protocol='http'):
+def _run_fake_otlp(
+    port, requests=None, dump=None, protocol='http', status=None
+):
     cmd = [FAKE_OTLP_BIN, '--port', str(port), '--protocol', protocol]
+    if status is not None:
+        cmd += ['--status', str(status)]
     if requests is not None:
         cmd += ['--requests', str(requests)]
     if dump is not None:
@@ -153,6 +166,106 @@ def _has_keyed_int_attr(body, key, value):
     return False
 
 
+def _otlp_str_value(value):
+    """Encode an OTLP AnyValue string_value as it appears on the wire.
+
+    string_value is field 1 of AnyValue with length-delimited wire type, so the
+    tag byte is (1 << 3) | 2 == 0x0a, followed by the length as a varint and the
+    bytes themselves.
+    """
+    out = bytearray(b'\x0a')
+    length = len(value)
+    while True:
+        byte = length & 0x7F
+        length >>= 7
+        out.append(byte | 0x80 if length else byte)
+        if not length:
+            break
+    out += value
+    return bytes(out)
+
+
+def _has_keyed_str_attr(body, key, value):
+    """Whether `key` is followed by a string_value attribute equal to `value`.
+
+    Same anchoring rule as _has_keyed_int_attr: the payload holds raw trace ids
+    and timestamps, so only the bytes just after an occurrence of the key make
+    this a statement about the attribute.
+    """
+    want = _otlp_str_value(value)
+    at = body.find(key)
+    while at != -1:
+        if want in body[at + len(key):at + len(key) + 16]:
+            return True
+        at = body.find(key, at + 1)
+    return False
+
+
+def _span_times(body, trace_id):
+    """Return (start_unix_nano, end_unix_nano) of the first span in the dump
+    whose trace id is `trace_id`.
+
+    A Span message starts with its trace_id (field 1, 16 bytes), and the
+    encoder writes the fields in field order, so the message is walked from
+    that point: start_time_unix_nano is field 7 and end_time_unix_nano is
+    field 8, both fixed64.
+    """
+
+    def varint(pos):
+        value = shift = 0
+        while True:
+            byte = body[pos]
+            pos += 1
+            value |= (byte & 0x7F) << shift
+            shift += 7
+            if not byte & 0x80:
+                return value, pos
+
+    pos = body.find(b'\x0a\x10' + trace_id)
+    assert pos != -1, 'no span with the trace id in the dump'
+    start = end = None
+    while pos < len(body):
+        tag, pos = varint(pos)
+        field, wire = tag >> 3, tag & 7
+        if wire == 0:
+            value, pos = varint(pos)
+        elif wire == 1:
+            value = int.from_bytes(body[pos:pos + 8], 'little')
+            pos += 8
+        elif wire == 2:
+            length, pos = varint(pos)
+            value = body[pos:pos + length]
+            pos += length
+        elif wire == 5:
+            value = int.from_bytes(body[pos:pos + 4], 'little')
+            pos += 4
+        else:
+            raise AssertionError(f'bad wire type {wire} in the span')
+        if field == 7:
+            start = value
+        elif field == 8:
+            end = value
+            break
+        elif field > 8:
+            break
+    assert start is not None and end is not None, 'span without times'
+    return start, end
+
+
+def _wait_for_trace(dump, want):
+    """Poll the dump until a span with the raw trace id `want` is in it."""
+    deadline = time.monotonic() + EXPORT_TIMEOUT
+    body = b''
+    while time.monotonic() < deadline:
+        if os.path.exists(dump):
+            with open(dump, 'rb') as f:
+                body = f.read()
+            if want in body:
+                break
+        time.sleep(0.2)
+    return body
+
+
 def _response_headers_lower(resp):
     return {k.lower(): v for k, v in resp['headers'].items()}
 
@@ -210,6 +323,65 @@ def test_otel_span_exported_with_service_name(tmp_path, protocol):
         assert b'http.request.method' in body, 'span must carry semconv method attr'
         assert b'url.path' in body, 'span must carry semconv url.path attr'
         assert b'http.response.status_code' in body, 'span must carry status attr'
+
+        # url.scheme and network.protocol.version are constant per request, and
+        # now travel as ids into a Rust-side table (nxt_otel_value_id_t).  Assert
+        # the value beside its key, not the key alone: a mis-keyed id keeps the
+        # key and changes the text.
+        assert _has_keyed_str_attr(
+            body, b'url.scheme', b'http'
+        ), 'span must carry url.scheme=http'
+        assert _has_keyed_str_attr(
+            body, b'network.protocol.version', b'1.1'
+        ), 'span must carry network.protocol.version=1.1'
+    finally:
+        _kill(proc)
+
+
+@_skipif_no_fake_otlp
+@pytest.mark.parametrize('protocol', ['http', 'grpc'])
+def test_otel_span_application_type(tmp_path, protocol):
+    """A request that reaches an application records unit.application.type.
+
+    The value travels as a nxt_otel_value_id_t into ATTR_VALUE_STRINGS on the
+    Rust side.  The return-200 route of the other tests never sets it.
+    """
+    if not option.available['modules'].get('python'):
+        pytest.skip('no python module')
+
+    port = _get_free_port()
+    dump = str(tmp_path / 'otlp_dump.bin')
+    proc = _run_fake_otlp(port, requests=1, dump=dump, protocol=protocol)
+    try:
+        # Skips when unit was built without --otel.
+        _configure_or_skip(port, protocol=protocol)
+
+        app = f'{option.test_dir}/python/empty'
+        conf = _config(_valid_telemetry(port, protocol=protocol))
+        conf['routes'] = [{"action": {"pass": "applications/empty"}}]
+        conf['applications'] = {
+            "empty": {
+                "type": "python",
+                "processes": {"spare": 0},
+                "path": app,
+                "working_directory": app,
+                "module": "wsgi",
+            }
+        }
+        assert 'success' in client.conf(conf)
+
+        assert _get_until_header('traceparent')['status'] == 200
+
+        try:
+            proc.wait(timeout=EXPORT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            pytest.fail('fake_otlp did not receive an exported span')
+
+        with open(dump, 'rb') as f:
+            body = f.read()
+        assert _has_keyed_str_attr(
+            body, b'unit.application.type', b'python'
+        ), 'span must carry unit.application.type=python'
     finally:
         _kill(proc)
 
@@ -354,6 +526,275 @@ def test_otel_traceparent_inherited(tmp_path, protocol):
         assert bytes.fromhex(echoed_parent_id) in body, (
             'the parent-id handed onward must be the id of the span FreeUnit '
             'itself exported'
+        )
+    finally:
+        _kill(proc)
+
+
+@_skipif_no_fake_otlp
+def test_otel_traceparent_inherited_split_header(tmp_path):
+    """The inbound traceparent is kept when the request header arrives in
+    two TCP reads and traceparent is in the second one.
+
+    The span must start only after the whole header is parsed. Before the
+    fix, nxt_h1p_conn_request_init() started it after the first read, so the
+    span got a new trace id and the traceparent was ignored.
+
+    The span is created late, but it must start when the request arrived:
+    its duration must cover the gap between the two writes."""
+    port = _get_free_port()
+    dump = str(tmp_path / 'otlp_dump.bin')
+    proc = _run_fake_otlp(port, dump=dump)
+    try:
+        _configure_or_skip(port)
+
+        # Wait for the tracer before the request under test.
+        assert _get_until_header('traceparent')['status'] == 200
+
+        sock = socket.create_connection(('127.0.0.1', port_map.port(8080)))
+        try:
+            sock.sendall(b'GET / HTTP/1.1\r\nHost: localhost\r\n')
+            time.sleep(HEADER_GAP)
+            sock.sendall(
+                f'traceparent: 00-{TRACE_ID}-{PARENT_ID}-01\r\n'
+                'Connection: close\r\n\r\n'.encode()
+            )
+            resp = b''
+            while True:
+                data = sock.recv(4096)
+                if not data:
+                    break
+                resp += data
+        finally:
+            sock.close()
+
+        head = resp.split(b'\r\n\r\n', 1)[0].decode().lower()
+        assert head.startswith('http/1.1 200'), head
+        echoed = re.search(r'^traceparent: ([^\r\n]+)', head, re.M)
+        assert echoed is not None, head
+        assert echoed.group(1).split('-')[1] == TRACE_ID, (
+            f'echoed traceparent {echoed.group(1)} must keep the inbound '
+            f'trace id {TRACE_ID}'
+        )
+
+        want = bytes.fromhex(TRACE_ID)
+        body = _wait_for_trace(dump, want)
+        assert want in body, 'exported span must keep the inherited trace id'
+
+        start, end = _span_times(body, want)
+        assert end - start >= HEADER_GAP_MIN_NS, (
+            f'span duration {end - start} ns must cover the {HEADER_GAP} s '
+            'gap between the two header writes'
+        )
+    finally:
+        _kill(proc)
+
+
+@_skipif_no_fake_otlp
+def test_otel_split_header_400_span(tmp_path):
+    """A header that arrives in parts and then fails to parse still gets a
+    span with status 400 and the inbound trace id.
+
+    The error comes before nxt_http_request_start(), so the span does not
+    exist yet. nxt_otel_request_error_path() must start it from the fields
+    parsed so far."""
+    port = _get_free_port()
+    dump = str(tmp_path / 'otlp_dump.bin')
+    proc = _run_fake_otlp(port, dump=dump)
+    try:
+        _configure_or_skip(port)
+
+        # Wait for the tracer before the request under test.
+        assert _get_until_header('traceparent')['status'] == 200
+
+        sock = socket.create_connection(('127.0.0.1', port_map.port(8080)))
+        try:
+            sock.sendall(
+                b'GET / HTTP/1.1\r\nHost: localhost\r\n'
+                + f'traceparent: 00-{TRACE_ID}-{PARENT_ID}-01\r\n'.encode()
+            )
+            time.sleep(0.3)
+            sock.sendall(b'bad header line\r\n\r\n')
+            resp = b''
+            while True:
+                data = sock.recv(4096)
+                if not data:
+                    break
+                resp += data
+        finally:
+            sock.close()
+
+        assert resp.startswith(b'HTTP/1.1 400'), resp[:64]
+
+        want = bytes.fromhex(TRACE_ID)
+        body = _wait_for_trace(dump, want)
+        assert want in body, 'the 400 span must keep the inbound trace id'
+        span = body[body.find(want):]
+        assert _has_keyed_int_attr(span, STATUS_CODE_KEY, 400), (
+            'the 400 span must carry http.response.status_code 400'
+        )
+    finally:
+        _kill(proc)
+
+
+@_skipif_no_fake_otlp
+def test_otel_bad_chunk_400_span(tmp_path):
+    """A request that fails while its body is read still gets a span with
+    the inbound trace id, the request attributes and status 400.
+
+    The header arrives in two writes, with traceparent in the second one, so
+    the span must not start before the header is complete. The header is
+    complete when the bad chunk arrives, so the span is in HEADER state.
+    nxt_otel_request_error_path() must add the request attributes before it
+    ends the span."""
+    port = _get_free_port()
+    dump = str(tmp_path / 'otlp_dump.bin')
+    proc = _run_fake_otlp(port, dump=dump)
+    try:
+        _configure_or_skip(port)
+        # Without chunked_transform the router answers 411 before it
+        # reads the body.
+        assert 'success' in client.conf(
+            {'chunked_transform': True}, 'settings/http'
+        )
+
+        # Wait for the tracer before the request under test.
+        assert _get_until_header('traceparent')['status'] == 200
+
+        sock = socket.create_connection(('127.0.0.1', port_map.port(8080)))
+        try:
+            sock.sendall(
+                b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+                b'Transfer-Encoding: chunked\r\n'
+            )
+            time.sleep(0.3)
+            sock.sendall(
+                f'traceparent: 00-{TRACE_ID}-{PARENT_ID}-01\r\n\r\n'.encode()
+            )
+            time.sleep(0.3)
+            sock.sendall(b'zz\r\nbad\r\n0\r\n\r\n')
+            resp = b''
+            while True:
+                data = sock.recv(4096)
+                if not data:
+                    break
+                resp += data
+        finally:
+            sock.close()
+
+        assert resp.startswith(b'HTTP/1.1 400'), resp[:64]
+
+        want = bytes.fromhex(TRACE_ID)
+        body = _wait_for_trace(dump, want)
+        assert want in body, 'the 400 span must keep the inbound trace id'
+        span = body[body.find(want):]
+        assert b'http.request.method' in span, (
+            'the 400 span must carry the request attributes'
+        )
+        assert _has_keyed_int_attr(span, STATUS_CODE_KEY, 400), (
+            'the 400 span must carry http.response.status_code 400'
+        )
+    finally:
+        _kill(proc)
+
+
+@_skipif_no_fake_otlp
+def test_otel_body_disconnect_span(tmp_path):
+    """A client that closes the connection while its body is read still
+    gets a span with the inbound trace id and the request attributes.
+
+    The header arrives in two writes, with traceparent in the second one, so
+    the span must not start before the header is complete. The span is in
+    HEADER state at the close. nxt_h1p_conn_request_error() must add the
+    attributes before the pool cleanup ends the span."""
+    port = _get_free_port()
+    dump = str(tmp_path / 'otlp_dump.bin')
+    proc = _run_fake_otlp(port, dump=dump)
+    try:
+        _configure_or_skip(port)
+
+        # Wait for the tracer before the request under test.
+        assert _get_until_header('traceparent')['status'] == 200
+
+        sock = socket.create_connection(('127.0.0.1', port_map.port(8080)))
+        sock.sendall(
+            b'POST / HTTP/1.1\r\nHost: localhost\r\n'
+            b'Content-Length: 100\r\n'
+        )
+        time.sleep(0.3)
+        sock.sendall(
+            f'traceparent: 00-{TRACE_ID}-{PARENT_ID}-01\r\n\r\n'.encode()
+        )
+        time.sleep(0.3)
+        sock.sendall(b'x' * 10)
+        time.sleep(0.3)
+        sock.close()
+
+        want = bytes.fromhex(TRACE_ID)
+        body = _wait_for_trace(dump, want)
+        assert want in body, 'the span must keep the inbound trace id'
+        span = body[body.find(want):]
+        assert b'http.request.method' in span, (
+            'the span must carry the request attributes'
+        )
+    finally:
+        _kill(proc)
+
+
+@_skipif_no_fake_otlp
+def test_otel_header_timeout_408_span(tmp_path):
+    """A header that never completes gets a 408 after header_read_timeout,
+    and the 408 span has the inbound trace id, the request attributes, the
+    status 408, and a duration that covers the wait.
+
+    The span does not exist when the timer fires: nxt_otel_request_error_path()
+    must start it from the fields parsed so far, and its start must be the
+    arrival of the request, not the creation of the span."""
+    port = _get_free_port()
+    dump = str(tmp_path / 'otlp_dump.bin')
+    proc = _run_fake_otlp(port, dump=dump)
+    try:
+        _configure_or_skip(port)
+        assert 'success' in client.conf(
+            {'header_read_timeout': 1}, 'settings/http'
+        )
+
+        # Wait for the tracer before the request under test.
+        assert _get_until_header('traceparent')['status'] == 200
+
+        sock = socket.create_connection(('127.0.0.1', port_map.port(8080)))
+        try:
+            sock.sendall(
+                b'GET / HTTP/1.1\r\nHost: localhost\r\n'
+                + f'traceparent: 00-{TRACE_ID}-{PARENT_ID}-01\r\n'.encode()
+            )
+            sock.settimeout(10)
+            resp = b''
+            while True:
+                data = sock.recv(4096)
+                if not data:
+                    break
+                resp += data
+        finally:
+            sock.close()
+
+        assert resp.startswith(b'HTTP/1.1 408'), resp[:64]
+
+        want = bytes.fromhex(TRACE_ID)
+        body = _wait_for_trace(dump, want)
+        assert want in body, 'the 408 span must keep the inbound trace id'
+        span = body[body.find(want):]
+        assert b'http.request.method' in span, (
+            'the 408 span must carry the request attributes'
+        )
+        assert _has_keyed_int_attr(span, STATUS_CODE_KEY, 408), (
+            'the 408 span must carry http.response.status_code 408'
+        )
+
+        start, end = _span_times(body, want)
+        assert 900_000_000 <= end - start < 10_000_000_000, (
+            f'span duration {end - start} ns must cover the 1 s '
+            'header_read_timeout'
         )
     finally:
         _kill(proc)
@@ -928,3 +1369,38 @@ def test_otel_status_counts_failed_spans():
     assert telemetry is not None, '/status must report telemetry when configured'
     assert telemetry['spans']['failed'] > 0, 'a refused export must be counted'
     assert telemetry['spans']['exported'] == 0, 'nothing can have been exported'
+
+
+@_skipif_no_fake_otlp
+@pytest.mark.parametrize('protocol', ['http', 'grpc'])
+def test_otel_export_not_retried(tmp_path, protocol):
+    """A batch the collector refuses with a retryable error is sent once.
+
+    opentelemetry-otlp 0.33 retries such an export up to 3 times by default.
+    The batch worker blocks during the retries, so FreeUnit turns them off.
+    With batch_size 1 each failed span is one batch, so the collector must
+    see exactly one request per failed span.
+    """
+    port = _get_free_port()
+    dump = tmp_path / 'otlp_dump.bin'
+    proc = _run_fake_otlp(port, dump=str(dump), protocol=protocol, status=503)
+    try:
+        _configure_or_skip(port, protocol=protocol)
+
+        assert _get_until_header('traceparent')['status'] == 200
+
+        telemetry = _wait_for_spans('failed')
+        assert telemetry is not None, '/status must report telemetry'
+        assert telemetry['spans']['failed'] > 0, 'a 503 export must fail'
+
+        # With retries on, the last attempt of a batch comes about 1 s after
+        # the first.  Wait longer than that, then compare the counts.
+        time.sleep(4)
+
+        failed = _status_telemetry()['spans']['failed']
+        requests = dump.read_bytes().count(b'--fake_otlp-request-boundary--')
+        assert requests == failed, (
+            f'{requests} export requests for {failed} failed batches'
+        )
+    finally:
+        _kill(proc)

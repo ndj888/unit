@@ -62,6 +62,16 @@ typedef struct {
 } nxt_conf_map_t;
 
 
+/*
+ * NXT_CONF_MAP_SIZE converts a number to ssize_t.  So a size must be at least
+ * -NXT_CONF_SIZE_BOUND and less than NXT_CONF_SIZE_BOUND, NXT_SIZE_T_MAX + 1:
+ * 2^31 with a 32-bit size_t, 2^63 with a 64-bit size_t.  A power of two is
+ * exact as a double.  The validator refuses a negative size, except in the
+ * stored configuration at startup.
+ */
+#define NXT_CONF_SIZE_BOUND  ((uint64_t) NXT_SIZE_T_MAX + 1)
+
+
 typedef struct {
     uint32_t             level;
     uint8_t              more_space;  /* 1 bit. */
@@ -84,6 +94,7 @@ typedef struct {
     nxt_tstr_state_t     *tstr_state;
     nxt_mp_t             *conf_pool;
     nxt_uint_t           ver;
+    uint8_t              restored;    /* 1 bit: the stored configuration. */
     nxt_conf_vldt_path_t *path;       /* Stack (top = deepest segment). */
     nxt_str_t            pointer;     /* RFC 6901 pointer at error site. */
     nxt_str_t            suggestion;  /* "Did you mean X" member name. */
@@ -119,6 +130,12 @@ nxt_conf_value_t *nxt_conf_json_parse(nxt_mp_t *mp, u_char *start, u_char *end,
 #define nxt_conf_json_parse_str(mp, str)                                      \
     nxt_conf_json_parse(mp, (str)->start, (str)->start + (str)->length, NULL)
 
+/*
+ * nxt_conf_json_length() returns SIZE_MAX if the length does not fit in
+ * size_t.  No allocation of SIZE_MAX bytes succeeds.  A caller that adds to
+ * the length uses nxt_size_add().  A caller that sizes a shared memory
+ * segment with it refuses SIZE_MAX.
+ */
 size_t nxt_conf_json_length(const nxt_conf_value_t *value,
     nxt_conf_json_pretty_t *pretty);
 u_char *nxt_conf_json_print(u_char *p, const nxt_conf_value_t *value,

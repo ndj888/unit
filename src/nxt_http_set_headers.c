@@ -11,6 +11,9 @@
 typedef struct {
     nxt_str_t               name;
     nxt_tstr_t              *value;
+
+    /* A constant value has a control byte; set at configuration time. */
+    uint8_t                 unsafe;  /* 1 bit */
 } nxt_http_header_val_t;
 
 
@@ -34,6 +37,7 @@ static nxt_http_set_headers_ctx_t *nxt_http_set_headers_ctx(
     nxt_http_request_t *r);
 static nxt_int_t nxt_http_set_headers_value(nxt_http_request_t *r,
     nxt_http_set_headers_ctx_t *ctx, nxt_uint_t i);
+static nxt_bool_t nxt_http_set_headers_unsafe(const nxt_str_t *value);
 
 
 /*
@@ -48,48 +52,21 @@ static nxt_int_t nxt_http_set_headers_value(nxt_http_request_t *r,
  * evaluate preconditions at all in that case, which loses the 304 but is never
  * wrong.
  *
- * Only the name matters here, so no template value is resolved.
+ * Only the name matters here, so no template value is resolved.  The names
+ * are fixed at configuration time, so nxt_http_set_headers_init() sets the
+ * flag.
  */
 
 nxt_bool_t
 nxt_http_set_headers_override_validators(nxt_http_request_t *r)
 {
-    nxt_uint_t             i, n;
-    nxt_http_action_t      *action;
-    nxt_http_header_val_t  *header;
-
-    action = r->action;
-
-    if (action == NULL || action->set_headers == NULL) {
-        return 0;
-    }
-
-    header = action->set_headers->elts;
-    n = action->set_headers->nelts;
-
-    for (i = 0; i < n; i++) {
-        if (header[i].name.length == nxt_length("ETag")
-            && nxt_strncasecmp(header[i].name.start, (u_char *) "ETag",
-                               nxt_length("ETag")) == 0)
-        {
-            return 1;
-        }
-
-        if (header[i].name.length == nxt_length("Last-Modified")
-            && nxt_strncasecmp(header[i].name.start,
-                               (u_char *) "Last-Modified",
-                               nxt_length("Last-Modified")) == 0)
-        {
-            return 1;
-        }
-    }
-
-    return 0;
+    return r->action != NULL && r->action->set_headers_validators;
 }
 
 
 /*
- * What nxt_http_set_headers() will later do to the response field "name".
+ * What nxt_http_set_headers() will later do to the response field
+ * Content-Encoding.
  *
  * Code that runs before the header is sent can ask this.  Compression needs
  * it: a Content-Encoding from "response_headers" replaces the one that a
@@ -112,11 +89,13 @@ nxt_http_set_headers_override_validators(nxt_http_request_t *r)
  * The status test is the same as in nxt_http_set_headers().  Keys are
  * applied in order, so the last key that matches and is not skipped gives
  * the result.  The search goes back from the end and stops at that key.
+ *
+ * nxt_http_set_headers_init() records whether a key has this name.  Without
+ * such a key, the search is not made.
  */
 
 nxt_http_set_header_op_t
-nxt_http_set_headers_field_op(nxt_http_request_t *r, const char *name,
-    size_t length)
+nxt_http_set_headers_encoding_op(nxt_http_request_t *r)
 {
     nxt_int_t                   ret;
     nxt_uint_t                  i;
@@ -124,9 +103,11 @@ nxt_http_set_headers_field_op(nxt_http_request_t *r, const char *name,
     nxt_http_header_val_t       *header;
     nxt_http_set_headers_ctx_t  *ctx;
 
+    static const nxt_str_t  content_encoding = nxt_string("Content-Encoding");
+
     action = r->action;
 
-    if (action == NULL || action->set_headers == NULL) {
+    if (action == NULL || !action->set_headers_encoding) {
         return NXT_HTTP_SET_HEADER_NONE;
     }
 
@@ -144,9 +125,7 @@ nxt_http_set_headers_field_op(nxt_http_request_t *r, const char *name,
     while (i > 0) {
         i--;
 
-        if (header[i].name.length != length
-            || nxt_memcasecmp(header[i].name.start, name, length) != 0)
-        {
+        if (!nxt_strcasestr_eq(&header[i].name, &content_encoding)) {
             continue;
         }
 
@@ -185,6 +164,13 @@ nxt_http_set_headers_init(nxt_router_conf_t *rtcf, nxt_http_action_t *action,
     nxt_conf_value_t       *value;
     nxt_http_header_val_t  *hv;
 
+    static const nxt_str_t  etag = nxt_string("ETag");
+    static const nxt_str_t  last_modified = nxt_string("Last-Modified");
+    static const nxt_str_t  content_encoding = nxt_string("Content-Encoding");
+    static const nxt_str_t  content_length = nxt_string("Content-Length");
+    static const nxt_str_t  transfer_encoding =
+                                          nxt_string("Transfer-Encoding");
+
     headers = nxt_array_create(rtcf->mem_pool, 4,
                                sizeof(nxt_http_header_val_t));
     if (nxt_slow_path(headers == NULL)) {
@@ -201,6 +187,20 @@ nxt_http_set_headers_init(nxt_router_conf_t *rtcf, nxt_http_action_t *action,
             break;
         }
 
+        /*
+         * Unit sets the body length of a response itself.  The validator
+         * refuses these names, but keeps them in a configuration stored
+         * by an earlier version, so a value for them is ignored here.  A
+         * null entry still removes the field, as it did before: a removal
+         * cannot give a response a second body length.
+         */
+        if (nxt_conf_type(value) == NXT_CONF_STRING
+            && (nxt_strcasestr_eq(&name, &content_length)
+                || nxt_strcasestr_eq(&name, &transfer_encoding)))
+        {
+            continue;
+        }
+
         hv = nxt_array_zero_add(headers);
         if (nxt_slow_path(hv == NULL)) {
             return NXT_ERROR;
@@ -215,6 +215,16 @@ nxt_http_set_headers_init(nxt_router_conf_t *rtcf, nxt_http_action_t *action,
 
         nxt_memcpy(hv->name.start, name.start, name.length);
 
+        if (nxt_strcasestr_eq(&name, &etag)
+            || nxt_strcasestr_eq(&name, &last_modified))
+        {
+            action->set_headers_validators = 1;
+        }
+
+        if (nxt_strcasestr_eq(&name, &content_encoding)) {
+            action->set_headers_encoding = 1;
+        }
+
         if (nxt_conf_type(value) == NXT_CONF_STRING) {
             nxt_conf_get_string(value, &str);
 
@@ -222,41 +232,21 @@ nxt_http_set_headers_init(nxt_router_conf_t *rtcf, nxt_http_action_t *action,
             if (nxt_slow_path(hv->value == NULL)) {
                 return NXT_ERROR;
             }
+
+            /*
+             * A constant value is the same for each request, so it is
+             * checked here once.  The configuration validator already
+             * rejects these bytes, so this flag stays 0 in practice.
+             */
+
+            if (nxt_tstr_is_const(hv->value)) {
+                nxt_tstr_str(hv->value, &str);
+                hv->unsafe = nxt_http_set_headers_unsafe(&str);
+            }
         }
     }
 
     return NXT_OK;
-}
-
-
-/*
- * Reject values that would inject a header boundary into the response.
- * Templated values (e.g. $uri, $arg_*) can carry CR/LF/NUL bytes if the
- * client encodes them in the request, and writing those bytes verbatim
- * into the wire serialiser yields HTTP response splitting.  Static
- * config values are operator-controlled and trusted, but the check is
- * cheap enough to apply to both paths.
- *
- * Per the RFC 9110 field-value grammar, all control bytes other than
- * HTAB are rejected, including DEL (0x7F); lenient downstream proxies
- * may otherwise reinterpret them.  HTAB and high (0x80+) bytes are
- * left alone.
- */
-static nxt_bool_t
-nxt_http_header_value_is_safe(const nxt_str_t *v)
-{
-    u_char  c;
-    size_t  i;
-
-    for (i = 0; i < v->length; i++) {
-        c = v->start[i];
-
-        if ((c < 0x20 && c != '\t') || c == 0x7F) {
-            return 0;
-        }
-    }
-
-    return 1;
 }
 
 
@@ -317,8 +307,8 @@ nxt_http_set_headers_ctx(nxt_http_request_t *r)
  *
  * A null value gives a null string, which removes the field.  A value that
  * is not safe in a field gives NXT_DECLINED, and the key is skipped.
- * nxt_http_set_headers() and nxt_http_set_headers_field_op() both use this,
- * so they agree on what each key does.
+ * nxt_http_set_headers() and nxt_http_set_headers_encoding_op() both use
+ * this, so they agree on what each key does.
  */
 
 static nxt_int_t
@@ -327,6 +317,7 @@ nxt_http_set_headers_value(nxt_http_request_t *r,
 {
     nxt_int_t              ret;
     nxt_str_t              *value;
+    nxt_bool_t             unsafe;
     nxt_router_conf_t      *rtcf;
     nxt_http_header_val_t  *hv;
 
@@ -348,9 +339,11 @@ nxt_http_set_headers_value(nxt_http_request_t *r,
 
     if (hv->value == NULL) {
         nxt_str_null(value);
+        unsafe = 0;
 
     } else if (nxt_tstr_is_const(hv->value)) {
         nxt_tstr_str(hv->value, value);
+        unsafe = hv->unsafe;
 
     } else {
         rtcf = r->conf->socket_conf->router_conf;
@@ -365,11 +358,11 @@ nxt_http_set_headers_value(nxt_http_request_t *r,
         if (nxt_slow_path(ret != NXT_OK)) {
             return NXT_ERROR;
         }
+
+        unsafe = nxt_http_set_headers_unsafe(value);
     }
 
-    if (value->start != NULL
-        && nxt_slow_path(!nxt_http_header_value_is_safe(value)))
-    {
+    if (nxt_slow_path(unsafe)) {
         ctx->state[i] = NXT_HTTP_SET_HEADERS_REJECTED;
         return NXT_DECLINED;
     }
@@ -377,6 +370,41 @@ nxt_http_set_headers_value(nxt_http_request_t *r,
     ctx->state[i] = NXT_HTTP_SET_HEADERS_RESOLVED;
 
     return NXT_OK;
+}
+
+
+/*
+ * Reject values that would inject a header boundary into the response.
+ * Templated values (e.g. $uri, $arg_*) can carry CR/LF/NUL bytes if the
+ * client encodes them in the request, and writing those bytes verbatim
+ * into the wire serialiser yields HTTP response splitting.  Static config
+ * values are operator-controlled and trusted, but they are checked too,
+ * once, by nxt_http_set_headers_init().
+ *
+ * Per the RFC 9110 field-value grammar, all control bytes other than HTAB
+ * are rejected, including DEL (0x7F); lenient downstream proxies may
+ * otherwise reinterpret them.  HTAB and high (0x80+) bytes are left alone.
+ */
+
+static nxt_bool_t
+nxt_http_set_headers_unsafe(const nxt_str_t *value)
+{
+    u_char  c;
+    size_t  j;
+
+    if (value->start == NULL) {
+        return 0;
+    }
+
+    for (j = 0; j < value->length; j++) {
+        c = value->start[j];
+
+        if (nxt_slow_path((c < 0x20 && c != '\t') || c == 0x7F)) {
+            return 1;
+        }
+    }
+
+    return 0;
 }
 
 
@@ -430,7 +458,7 @@ nxt_http_set_headers(nxt_http_request_t *r)
     n = action->set_headers->nelts;
 
     /*
-     * nxt_http_set_headers_field_op() can have resolved some keys already.
+     * nxt_http_set_headers_encoding_op() can have resolved some keys already.
      * Their stored results are used here, and they are not resolved again.
      */
 

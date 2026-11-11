@@ -37,9 +37,9 @@
  *
  * libunit assigns ids as append-only indices into its outgoing array and
  * refuses to create a segment once that array reaches shm_mmap_limit, which
- * is shm_limit / PORT_MMAP_DATA_SIZE computed in uint32_t.  So no conforming
- * peer can exceed floor(UINT32_MAX / PORT_MMAP_DATA_SIZE), whatever the
- * configured shm limit.
+ * is the uint32_t shm_limit / PORT_MMAP_DATA_SIZE, rounded up
+ * (nxt_unit_shm_mmap_limit()).  So no conforming peer can exceed
+ * floor(UINT32_MAX / PORT_MMAP_DATA_SIZE), whatever the configured shm limit.
  *
  * Derived from the geometry rather than written out, because
  * NXT_MMAP_TINY_CHUNK changes PORT_MMAP_DATA_SIZE by four orders of
@@ -161,7 +161,7 @@ nxt_inline nxt_bool_t
 nxt_port_mmap_get_free_chunk(nxt_free_map_t *m, nxt_chunk_id_t *c);
 
 #define nxt_port_mmap_get_chunk_busy(m, c)                                    \
-    ((m[FREE_IDX(c)] & FREE_MASK(c)) == 0)
+    ((nxt_atomic_load(&m[FREE_IDX(c)]) & FREE_MASK(c)) == 0)
 
 nxt_inline void
 nxt_port_mmap_set_chunk_busy(nxt_free_map_t *m, nxt_chunk_id_t c);
@@ -257,7 +257,7 @@ nxt_port_mmap_get_free_chunk(nxt_free_map_t *m, nxt_chunk_id_t *c)
     mask = default_mask << ((*c) % FREE_BITS);
 
     for (i = start; i < MAX_FREE_IDX; i++) {
-        bits = m[i] & mask;
+        bits = nxt_atomic_load(&m[i]) & mask;
         mask = default_mask;
 
         if (bits == 0) {
@@ -294,17 +294,19 @@ nxt_port_mmap_chk_set_chunk_busy(nxt_free_map_t *m, nxt_chunk_id_t c)
 
     f = m + FREE_IDX(c);
 
-    while ( (*f & FREE_MASK(c)) != 0 ) {
+    for ( ;; ) {
+        free_val = nxt_atomic_load(f);
 
-        free_val = *f | FREE_MASK(c);
+        if ((free_val & FREE_MASK(c)) == 0) {
+            return 0;
+        }
+
         busy_val = free_val & ~FREE_MASK(c);
 
         if (nxt_atomic_cmp_set(f, free_val, busy_val) != 0) {
             return 1;
         }
     }
-
-    return 0;
 }
 
 

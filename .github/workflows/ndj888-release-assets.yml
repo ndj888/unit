@@ -1,12 +1,12 @@
 name: ndj888 release assets
 
 # Build and test the core plus PHP/Python modules, then package Linux amd64 assets.
-# PRs targeting master validate the merge ref; published releases and manual runs
+# PRs targeting codex/develop validate the merge ref; published releases and manual runs
 # build the selected tag and attach assets to its existing GitHub Release.
 # Both jobs are restricted to ndj888/unit so upstream and other forks stay idle.
 on:
   pull_request:
-    branches: [master]
+    branches: [codex/develop]
   release:
     types: [published]
   workflow_dispatch:

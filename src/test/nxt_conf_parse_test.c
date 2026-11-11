@@ -150,7 +150,20 @@ nxt_http_route_addr_test(nxt_thread_t *thr)
 
 
 
-/* Packed: the fields after "flag" are misaligned, for UBSan to catch. */
+/*
+ * Packed: the fields after "flag" are misaligned, for UBSan to catch.  Clang
+ * reports the nxt_str_t members with -Wunaligned-access on targets without
+ * unaligned access, such as ARMv6.  That misalignment is the purpose here.
+ * Clang 13 and older do not know the option and reject its name under
+ * -Werror, so it is ignored only where it exists.
+ */
+
+#if defined(__clang__)
+#pragma clang diagnostic push
+#if __has_warning("-Wunaligned-access")
+#pragma clang diagnostic ignored "-Wunaligned-access"
+#endif
+#endif
 
 typedef struct {
     uint8_t     flag;
@@ -168,6 +181,10 @@ typedef struct {
     uint8_t     bad8;
     int32_t     bad32;
 } nxt_packed nxt_conf_map_test_t;
+
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 
 #define nxt_conf_map_test_field(field, type)                                  \
@@ -298,6 +315,291 @@ nxt_conf_map_object_test(nxt_thread_t *thr)
 
     nxt_log_error(NXT_LOG_NOTICE, thr->log,
                   "nxt_conf_map_object() alignment test passed");
+
+done:
+
+    nxt_mp_destroy(mp);
+
+    return ret;
+}
+
+
+typedef struct {
+    nxt_conf_map_type_t  type;
+    const char           *num;
+    nxt_int_t            ret;
+    int64_t              val;
+} nxt_conf_map_bound_case_t;
+
+
+static nxt_int_t
+nxt_conf_map_bound_case(nxt_thread_t *thr, nxt_mp_t *mp,
+    const nxt_conf_map_bound_case_t *tc)
+{
+    int64_t           got;
+    nxt_str_t         json;
+    nxt_int_t         rc;
+    nxt_conf_map_t    map[1];
+    nxt_conf_value_t  *cv;
+    u_char            buf[64];
+
+    union {
+        int32_t     i32;
+        int64_t     i64;
+        int         i;
+        off_t       off;
+        nxt_msec_t  msec;
+    } dst;
+
+    json.start = buf;
+    json.length = nxt_sprintf(buf, buf + sizeof(buf), "{\"v\": %s}", tc->num)
+                  - buf;
+
+    cv = nxt_conf_json_parse(mp, json.start, json.start + json.length, NULL);
+
+    NXT_TEST_CHECK(thr->log, cv != NULL,
+                   "map bound test: %s did not parse", tc->num);
+
+    map[0].name = (nxt_str_t) nxt_string("v");
+    map[0].type = tc->type;
+    map[0].offset = 0;
+
+    nxt_memzero(&dst, sizeof(dst));
+
+    rc = nxt_conf_map_object(mp, cv, map, 1, &dst);
+
+    switch (tc->type) {
+    case NXT_CONF_MAP_INT32:
+        got = dst.i32;
+        break;
+    case NXT_CONF_MAP_INT:
+        got = dst.i;
+        break;
+    case NXT_CONF_MAP_OFF:
+        got = dst.off;
+        break;
+    case NXT_CONF_MAP_MSEC:
+        got = dst.msec;
+        break;
+    default:
+        got = dst.i64;
+        break;
+    }
+
+    NXT_TEST_CHECK(thr->log,
+                   rc == tc->ret && (rc != NXT_OK || got == tc->val),
+                   "map bound test failed: type %d, %s gave %i and %L, "
+                   "not %i and %L", (int) tc->type, tc->num, rc, got,
+                   tc->ret, tc->val);
+
+    return NXT_OK;
+}
+
+
+/*
+ * nxt_conf_map_object() returns NXT_ERROR for a number that has no value in
+ * the integer destination type.  Each case maps one member and checks the
+ * status, and for NXT_OK the value.  Numbers of 2^63 or more cannot be
+ * parsed, so the 64-bit bounds have only in-range cases here.
+ * NXT_CONF_MAP_MSEC does not fail: it maps a number out of its range to
+ * 4294967 seconds.
+ */
+nxt_int_t
+nxt_conf_map_bound_test(nxt_thread_t *thr)
+{
+    nxt_mp_t    *mp;
+    nxt_int_t   ret;
+    nxt_uint_t  i;
+
+    static const nxt_conf_map_bound_case_t  cases[] = {
+        { NXT_CONF_MAP_INT32, "2147483647", NXT_OK, 2147483647 },
+        { NXT_CONF_MAP_INT32, "-2147483648", NXT_OK, -2147483647 - 1 },
+        { NXT_CONF_MAP_INT32, "2147483648", NXT_ERROR, 0 },
+        { NXT_CONF_MAP_INT32, "-2147483649", NXT_ERROR, 0 },
+        { NXT_CONF_MAP_INT32, "1e10", NXT_ERROR, 0 },
+
+        { NXT_CONF_MAP_INT, "2147483647", NXT_OK, 2147483647 },
+        { NXT_CONF_MAP_INT, "-2147483648", NXT_OK, -2147483647 - 1 },
+        { NXT_CONF_MAP_INT, "2147483648", NXT_ERROR, 0 },
+        { NXT_CONF_MAP_INT, "-2147483649", NXT_ERROR, 0 },
+
+        { NXT_CONF_MAP_INT64, "9.22337203e18", NXT_OK,
+          9223372030000000000LL },
+        { NXT_CONF_MAP_INT64, "-9.22337203e18", NXT_OK,
+          -9223372030000000000LL },
+
+#if (NXT_OFF_T_SIZE == 4)
+        { NXT_CONF_MAP_OFF, "2147483647", NXT_OK, 2147483647 },
+        { NXT_CONF_MAP_OFF, "-2147483648", NXT_OK, -2147483647 - 1 },
+        { NXT_CONF_MAP_OFF, "2147483648", NXT_ERROR, 0 },
+        { NXT_CONF_MAP_OFF, "-2147483649", NXT_ERROR, 0 },
+#else
+        { NXT_CONF_MAP_OFF, "2147483648", NXT_OK, 2147483648LL },
+        { NXT_CONF_MAP_OFF, "9.22337203e18", NXT_OK, 9223372030000000000LL },
+        { NXT_CONF_MAP_OFF, "-9.22337203e18", NXT_OK,
+          -9223372030000000000LL },
+#endif
+
+        { NXT_CONF_MAP_MSEC, "0", NXT_OK, 0 },
+        { NXT_CONF_MAP_MSEC, "4294967", NXT_OK, 4294967000LL },
+        /* A stored timeout out of the range gives the largest one. */
+        { NXT_CONF_MAP_MSEC, "4294968", NXT_OK, 4294967000LL },
+        { NXT_CONF_MAP_MSEC, "-1", NXT_OK, 4294967000LL },
+    };
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (mp == NULL) {
+        return NXT_ERROR;
+    }
+
+    ret = NXT_OK;
+
+    for (i = 0; i < nxt_nitems(cases); i++) {
+        ret = nxt_conf_map_bound_case(thr, mp, &cases[i]);
+        if (ret != NXT_OK) {
+            break;
+        }
+    }
+
+    nxt_mp_destroy(mp);
+
+    if (ret == NXT_OK) {
+        nxt_log_error(NXT_LOG_NOTICE, thr->log, "nxt_conf_map_object() bound "
+                      "test passed");
+    }
+
+    return ret;
+}
+
+
+/*
+ * nxt_conf_get_object_member() rejects a member on its name length and
+ * first byte before memcmp().  It must still return the first member with
+ * an equal name, and its index, as a plain scan with nxt_strstr_eq() does,
+ * and leave "index" alone on a miss.  The names include an empty one,
+ * short strings and long strings (more than 14 bytes are stored out of
+ * line), names that differ only in the length, the first byte or the last
+ * byte, and a duplicate.
+ */
+
+nxt_int_t
+nxt_conf_member_lookup_test(nxt_thread_t *thr)
+{
+    uint32_t          index, ref_index, next;
+    nxt_mp_t          *mp;
+    nxt_str_t         name, str;
+    nxt_int_t         ret;
+    nxt_uint_t        i, n, k;
+    nxt_conf_value_t  *object, *value, *ref, *member;
+
+    static const char  *members[] = {
+        "", "a", "b", "A", "ab", "ba", "aa", "dup", "pass", "dup",
+        "abcdefghijklmn", "abcdefghijklmo", "bbcdefghijklmn",
+        "abcdefghijklmno", "abcdefghijklmnp", "bbcdefghijklmno",
+        "abcdefghijklmnop", "route0", "route1", "route9", "routes",
+    };
+
+    static const char  *misses[] = {
+        "c", "B", "abc", "du", "dupx", "Dup", "pas", "passx",
+        "abcdefghijklm", "abcdefghijklmnq", "cbcdefghijklmno",
+        "abcdefghijklmnopq", "route2", "Route0", "route",
+    };
+
+    mp = nxt_mp_create(1024, 128, 256, 32);
+    if (mp == NULL) {
+        return NXT_ERROR;
+    }
+
+    ret = NXT_ERROR;
+
+    n = nxt_nitems(members);
+
+    object = nxt_conf_create_object(mp, n);
+    if (object == NULL) {
+        goto done;
+    }
+
+    for (i = 0; i < n; i++) {
+        name.length = nxt_strlen(members[i]);
+        name.start = (u_char *) members[i];
+
+        nxt_conf_set_member_integer(object, &name, i, i);
+    }
+
+    for (k = 0; k < n + nxt_nitems(misses) + 1; k++) {
+
+        if (k < n) {
+            name.length = nxt_strlen(members[k]);
+            name.start = (u_char *) members[k];
+
+        } else if (k < n + nxt_nitems(misses)) {
+            name.length = nxt_strlen(misses[k - n]);
+            name.start = (u_char *) misses[k - n];
+
+        } else {
+            /* An empty name with a NULL start, as nxt_str_null() makes. */
+            name.length = 0;
+            name.start = NULL;
+        }
+
+        /* The reference: a plain scan for the first equal name. */
+
+        ref = NULL;
+        ref_index = 0xdeadbeef;
+        next = 0;
+
+        for ( ;; ) {
+            member = nxt_conf_next_object_member(object, &str, &next);
+            if (member == NULL) {
+                break;
+            }
+
+            if (nxt_strstr_eq(&str, &name)) {
+                ref = member;
+                ref_index = next - 1;
+                break;
+            }
+        }
+
+        index = 0xdeadbeef;
+        value = nxt_conf_get_object_member(object, &name, &index);
+
+        if (value != ref || index != ref_index
+            || (k < n && value == NULL))
+        {
+            nxt_log_alert(thr->log, "nxt_conf_get_object_member(\"%V\") "
+                          "gave member %D, expected %D", &name,
+                          (value != NULL) ? (int32_t) index : -1,
+                          (ref != NULL) ? (int32_t) ref_index : -1);
+            goto done;
+        }
+
+        /* NULL "index" is allowed. */
+
+        if (nxt_conf_get_object_member(object, &name, NULL) != ref) {
+            nxt_log_alert(thr->log, "nxt_conf_get_object_member() with NULL "
+                          "index gave another member");
+            goto done;
+        }
+    }
+
+    /* The duplicate name gives the first of the two members. */
+
+    name.length = 3;
+    name.start = (u_char *) "dup";
+
+    if (nxt_conf_get_object_member(object, &name, &index) == NULL
+        || index != 7)
+    {
+        nxt_log_alert(thr->log, "nxt_conf_get_object_member(\"dup\") did not "
+                      "give the first duplicate");
+        goto done;
+    }
+
+    ret = NXT_OK;
+
+    nxt_log_error(NXT_LOG_NOTICE, thr->log,
+                  "nxt_conf_get_object_member() test passed");
 
 done:
 

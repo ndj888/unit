@@ -17,7 +17,6 @@ jobs:
     # otherwise burn the owner's Anthropic quota and feed untrusted text into
     # the run (prompt injection). The author_association field differs per
     # event type, so each branch carries its own check.
-    # The ndj888/unit fork lacks upstream secrets; run only upstream.
     if: |
       github.repository == 'freeunitorg/freeunit' && (
         (github.event_name == 'issue_comment' &&
@@ -33,7 +32,7 @@ jobs:
           (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
           contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association))
       )
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     permissions:
       contents: read
@@ -49,7 +48,7 @@ jobs:
 
       - name: Run Claude Code
         id: claude
-        uses: anthropics/claude-code-action@cab360f6565aa35a51d6ce9e43f1f4287c0a32ea # v1.0.241
+        uses: anthropics/claude-code-action@4845bacbb38b3c4b15d948f035349786f678e068 # v1.0.267
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
@@ -76,7 +75,6 @@ jobs:
   # The reply text must NOT contain the literal trigger string, otherwise the
   # bot's own comment re-fires issue_comment and loops forever.
   claude-denied:
-    # The ndj888/unit fork lacks upstream secrets; run only upstream.
     if: |
       github.repository == 'freeunitorg/freeunit' && (
         (github.event_name == 'issue_comment' &&
@@ -92,7 +90,7 @@ jobs:
           (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
           !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association))
       )
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       issues: write

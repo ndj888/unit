@@ -56,9 +56,20 @@ struct nxt_http_comp_type_s {
 };
 
 struct nxt_http_comp_opts_s {
-    int8_t                      level;
+    int                         level;
     nxt_off_t                   min_len;
 };
+
+/*
+ * nxt_conf_map_object() writes the size of the map type, not the size of
+ * the field.  NXT_CONF_MAP_INT writes an int.  NXT_CONF_MAP_OFF writes an
+ * off_t.
+ */
+nxt_static_assert(sizeof(((nxt_http_comp_opts_t *) 0)->level) == sizeof(int),
+                  "\"level\" is mapped with NXT_CONF_MAP_INT");
+nxt_static_assert(sizeof(((nxt_http_comp_opts_t *) 0)->min_len)
+                  == sizeof(off_t),
+                  "\"min_length\" is mapped with NXT_CONF_MAP_OFF");
 
 struct nxt_http_comp_compressor_s {
     const nxt_http_comp_type_t  *type;
@@ -130,7 +141,7 @@ static const nxt_conf_map_t  nxt_http_comp_compressors_opts_map[] = {
         offsetof(nxt_http_comp_opts_t, level),
     }, {
         nxt_string("min_length"),
-        NXT_CONF_MAP_SIZE,
+        NXT_CONF_MAP_OFF,
         offsetof(nxt_http_comp_opts_t, min_len),
     },
 };
@@ -285,12 +296,44 @@ nxt_http_comp_compress_app_response(nxt_task_t *task, nxt_http_request_t *r,
         in->next = NULL;
 
         /*
-         * Buffers that did not come through shared memory are passed
-         * through untouched: the trailing sync/last buffer carries no data,
-         * and a plain-mode response is not compressed at all (the same
-         * condition the single-buffer version tested on the head).
+         * Only the trailing sync/last buffer, which carries no data, is
+         * passed through untouched.  A body small enough to travel in an
+         * ordinary port message arrives as plain memory rather than as a
+         * port-mmap buffer; it is compressed all the same, because the
+         * Content-Encoding field has already been committed (#162).  Both
+         * kinds are released through their own completion handler below.
          */
-        if (!nxt_buf_is_port_mmap(in)) {
+        if (nxt_buf_is_sync(in) || !nxt_buf_is_mem(in)) {
+            /*
+             * The last buffer with the stream still open: the length is
+             * unknown, or the application sent fewer bytes than its
+             * Content-Length said, so no data buffer ended the stream.
+             * The Content-Encoding field is committed, so the stream is
+             * ended here, with no input.  A HEAD response drops its body
+             * buffers, this one included.
+             */
+            if (nxt_buf_is_last(in) && ctx->live) {
+                buf_len = nxt_http_comp_bound(ctx, 0)
+                          + NXT_HTTP_COMP_FLUSH_SLACK;
+
+                buf = nxt_buf_mem_ts_alloc(task, r->mem_pool, buf_len);
+                if (nxt_slow_path(buf == NULL)) {
+                    goto fail;
+                }
+
+                cbytes = nxt_http_comp_compress(ctx, buf->mem.start, buf_len,
+                                                NULL, 0, true);
+                if (nxt_slow_path(cbytes == -1)) {
+                    buf->completion_handler(task, buf, buf->parent);
+                    goto fail;
+                }
+
+                buf->mem.free += cbytes;
+
+                *tail = buf;
+                tail = &buf->next;
+            }
+
             *tail = in;
             tail = &in->next;
             continue;
@@ -298,6 +341,11 @@ nxt_http_comp_compress_app_response(nxt_task_t *task, nxt_http_request_t *r,
 
         in_len = in->mem.free - in->mem.pos;
 
+        /*
+         * A known length ends the stream with the byte that reaches it.
+         * An unknown length (-1) is never reached here: the last buffer,
+         * a sync buffer, ends the stream above.
+         */
         last = ctx->clen_sent + in_len == ctx->resp_clen;
 
         if (in_len == 0 && !last) {
@@ -320,7 +368,12 @@ nxt_http_comp_compress_app_response(nxt_task_t *task, nxt_http_request_t *r,
         cbytes = nxt_http_comp_compress(ctx, buf->mem.start, buf_len,
                                         in->mem.pos, in_len, last);
         if (nxt_slow_path(cbytes == -1)) {
-            nxt_buf_free(buf->data, buf);
+            /*
+             * nxt_buf_mem_ts_alloc() retained the pool; only the buffer's
+             * completion handler releases it.  nxt_buf_free() is a plain
+             * pool free, and left the pool retained once per failure.
+             */
+            buf->completion_handler(task, buf, buf->parent);
             goto fail;
         }
 
@@ -365,6 +418,70 @@ fail:
 }
 
 
+/*
+ * The length nxt_http_comp_compress_static_response() would give the same
+ * file, for HEAD (RFC 9110 Sect. 9.3.2).  It runs the same chunks through
+ * the same compressor, so the length is the one GET sends, but into a
+ * scratch buffer that is reused for each chunk: no temp file is made, and
+ * the output is dropped.  The stream ends with the last chunk.
+ */
+
+nxt_int_t
+nxt_http_comp_static_response_length(nxt_task_t *task, nxt_http_request_t *r,
+                                     nxt_file_t *f, nxt_file_info_t *fi,
+                                     size_t static_buf_len, size_t *out_total)
+{
+    bool                 last;
+    size_t               in_size, out_size, rest, n;
+    ssize_t              cbytes;
+    uint8_t              *in, *out;
+    nxt_int_t            ret;
+    nxt_http_comp_ctx_t  *ctx = r->comp_ctx;
+
+    *out_total = 0;
+
+    in_size = nxt_file_size(fi);
+    out_size = nxt_http_comp_bound(ctx, nxt_min(in_size, static_buf_len))
+               + NXT_HTTP_COMP_FLUSH_SLACK;
+
+    in = nxt_mem_mmap(NULL, in_size, PROT_READ, MAP_SHARED, f->fd, 0);
+    if (nxt_slow_path(in == MAP_FAILED)) {
+        nxt_alert(task, "mmap(%uz) of source failed %E", in_size, nxt_errno);
+        return NXT_ERROR;
+    }
+
+    out = nxt_malloc(out_size);
+    if (nxt_slow_path(out == NULL)) {
+        nxt_mem_munmap(in, in_size);
+        return NXT_ERROR;
+    }
+
+    ret = NXT_OK;
+    rest = in_size;
+
+    do {
+        n = nxt_min(rest, static_buf_len);
+
+        last = n == rest;
+
+        cbytes = nxt_http_comp_compress(ctx, out, out_size,
+                                        in + in_size - rest, n, last);
+        if (cbytes == -1) {
+            ret = NXT_ERROR;
+            break;
+        }
+
+        *out_total += cbytes;
+        rest -= n;
+    } while (rest > 0);
+
+    nxt_free(out);
+    nxt_mem_munmap(in, in_size);
+
+    return ret;
+}
+
+
 nxt_int_t
 nxt_http_comp_compress_static_response(nxt_task_t *task, nxt_http_request_t *r,
                                        nxt_file_t **f, nxt_file_info_t *fi,
@@ -403,7 +520,20 @@ nxt_http_comp_compress_static_response(nxt_task_t *task, nxt_http_request_t *r,
     tfile.name = (nxt_file_name_t *)tmp_path;
 
     in_size = nxt_file_size(fi);
-    out_size = nxt_http_comp_bound(ctx, in_size);
+
+    /*
+     * One bound for the whole file, plus room for the flush marker each
+     * static_buf_len piece but the last ends with.  bound() promises room
+     * for one call over the whole input, not for the flushes.  zlib's bound
+     * for the non-default 9-bit window is the conservative one, about n / 8
+     * to spare, which hid that; with the 15-bit window it is tight, and an
+     * incompressible file of more than one piece filled the mapping before
+     * Z_FINISH completed, about 5 bytes short per flush.
+     * NXT_HTTP_COMP_FLUSH_SLACK per piece is what the application path adds
+     * per part as well.
+     */
+    out_size = nxt_http_comp_bound(ctx, in_size)
+               + (in_size / static_buf_len + 1) * NXT_HTTP_COMP_FLUSH_SLACK;
 
     ret = ftruncate(tfile.fd, out_size);
     if (nxt_slow_path(ret == -1)) {
@@ -605,25 +735,6 @@ nxt_http_comp_compressor_lookup_enabled(const nxt_http_comp_conf_t *conf,
     return NXT_HTTP_COMP_SCHEME_UNKNOWN;
 }
 
-
-/*
- * Tells whether the token names the identity coding.  Identity is a
- * representation that each response has.  So it is recognised from the
- * static table, not from the enabled compressors: it must be recognised
- * with no compressor enabled.
- */
-
-static bool
-nxt_http_comp_token_is_identity(const nxt_str_t *token)
-{
-    const nxt_http_comp_type_t  *identity;
-
-    identity = &nxt_http_comp_compressors[NXT_HTTP_COMP_SCHEME_IDENTITY];
-
-    return nxt_strcasestr_eq(token, &identity->token);
-}
-
-
 /*
  * We need to parse the 'Accept-Encoding` header as described by
  * <https://www.rfc-editor.org/rfc/rfc9110.html#field.accept-encoding>
@@ -640,6 +751,58 @@ nxt_http_comp_token_is_identity(const nxt_str_t *token)
  *
  * 'identity;q=0' seems to basically mean the same thing...
  */
+/*
+ * Tells whether a field name of 15 bytes is "Accept-Encoding" in any case.
+ * The result is that of nxt_strncasecmp() with "Accept-Encoding", but the
+ * compare takes 8, 4, 2 and 1 bytes at a time, and it reads only the 15
+ * bytes of the name.
+ *
+ * The fold mask sets bit 0x20 in each letter of the name.  A byte then
+ * gives the lowercase letter only if it is that letter in upper or lower
+ * case.  That is the fold of nxt_lowcase().  The '-' is not folded, so it
+ * must match exactly.  A NUL in the name does not match, as in
+ * nxt_strncasecmp(): the constant has no NUL to stop at.
+ *
+ * The constant and the mask are loaded from byte arrays in the same way as
+ * the name.  So the result does not depend on the byte order.
+ */
+
+nxt_inline bool
+nxt_http_comp_is_accept_encoding(const u_char *name)
+{
+    uint16_t  n2, l2, m2;
+    uint32_t  n4, l4, m4;
+    uint64_t  n8, l8, m8;
+
+    static const u_char  low[15] = {
+        'a', 'c', 'c', 'e', 'p', 't', '-',
+        'e', 'n', 'c', 'o', 'd', 'i', 'n', 'g',
+    };
+
+    static const u_char  fold[15] = {
+        0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00,
+        0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+    };
+
+    memcpy(&n8, name, 8);
+    memcpy(&l8, low, 8);
+    memcpy(&m8, fold, 8);
+
+    memcpy(&n4, name + 8, 4);
+    memcpy(&l4, low + 8, 4);
+    memcpy(&m4, fold + 8, 4);
+
+    memcpy(&n2, name + 12, 2);
+    memcpy(&l2, low + 12, 2);
+    memcpy(&m2, fold + 12, 2);
+
+    return (n8 | m8) == l8
+           && (n4 | m4) == l4
+           && (uint16_t) (n2 | m2) == l2
+           && (u_char) (name[14] | fold[14]) == low[14];
+}
+
+
 /*
  * Collects every Accept-Encoding field into one value.
  *
@@ -676,8 +839,7 @@ nxt_http_comp_accept_encoding(nxt_http_request_t *r, nxt_str_t *value)
          f = nxt_http_fields_next(&iter))
     {
         if (f->skip || f->name_length != accept_encoding.length
-            || nxt_strncasecmp(f->name, accept_encoding.start,
-                               accept_encoding.length) != 0)
+            || !nxt_http_comp_is_accept_encoding(f->name))
         {
             continue;
         }
@@ -721,8 +883,7 @@ nxt_http_comp_accept_encoding(nxt_http_request_t *r, nxt_str_t *value)
          f = nxt_http_fields_next(&iter))
     {
         if (f->skip || f->name_length != accept_encoding.length
-            || nxt_strncasecmp(f->name, accept_encoding.start,
-                               accept_encoding.length) != 0)
+            || !nxt_http_comp_is_accept_encoding(f->name))
         {
             continue;
         }
@@ -739,22 +900,83 @@ nxt_http_comp_accept_encoding(nxt_http_request_t *r, nxt_str_t *value)
 
 
 /*
+ * With compression off, identity is the only coding, and the client refuses
+ * it only with a weight of 0.  A weight comes after a ';'.  So when no
+ * Accept-Encoding field holds a ';', negotiation cannot end in 406 and has
+ * nothing to select.  This is the same test as the one in
+ * nxt_http_comp_select_compressor(), made on the fields themselves: the
+ * joined value holds a ';' exactly when one of its fields does.  It reads no
+ * response field and allocates nothing.
+ */
+
+static bool
+nxt_http_comp_accept_encoding_has_weight(nxt_http_request_t *r)
+{
+    nxt_http_field_t        *f;
+    nxt_http_fields_iter_t  iter;
+
+    for (f = nxt_http_fields_first(&iter, r->inline_fields,
+                                   r->num_inline_fields, r->fields);
+         f != NULL;
+         f = nxt_http_fields_next(&iter))
+    {
+        if (f->skip || f->name_length != nxt_length("Accept-Encoding")
+            || !nxt_http_comp_is_accept_encoding(f->name))
+        {
+            continue;
+        }
+
+        if (memchr(f->value, ';', f->value_length) != NULL) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+
+/*
  * The length that the compressor decision uses.  Returns -1 when the length
  * of the body is not known yet.
+ *
+ * An application's Content-Length arrives as a field.  Its value is not
+ * NUL-terminated by contract, and nxt_http_response_content_length() has
+ * already accepted it with optional whitespace around the digits, kept
+ * verbatim.  So the same trim runs here, and the digits are parsed over
+ * their length: strtol() read past the value, and on a 32-bit platform
+ * saturated at LONG_MAX for a body of 2 GiB or more.
  */
 
 static nxt_off_t
 nxt_http_comp_resp_length(const nxt_http_request_t *r)
 {
+    size_t            length;
+    const u_char      *p;
+    nxt_http_field_t  *f;
+
     if (r->resp.content_length_n > -1) {
         return r->resp.content_length_n;
     }
 
-    if (r->resp.content_length != NULL) {
-        return strtol((char *) r->resp.content_length->value, NULL, 10);
+    f = r->resp.content_length;
+
+    if (f == NULL) {
+        return -1;
     }
 
-    return -1;
+    p = f->value;
+    length = f->value_length;
+
+    while (length > 0 && (*p == ' ' || *p == '\t')) {
+        p++;
+        length--;
+    }
+
+    while (length > 0 && (p[length - 1] == ' ' || p[length - 1] == '\t')) {
+        length--;
+    }
+
+    return nxt_off_t_parse(p, length);
 }
 
 
@@ -762,8 +984,8 @@ nxt_http_comp_resp_length(const nxt_http_request_t *r)
  * Tells whether "min_length" refuses this response.  A body of unknown
  * length is compressed, so it is never below the minimum.
  *
- * nxt_http_comp_select_compressor() and nxt_http_comp_apply_compression()
- * both call this, and they must get the same answer.  The first decides
+ * nxt_http_comp_negotiate() and nxt_http_comp_apply_compression() both
+ * call this, and they must get the same answer.  The first decides
  * which coding is selected.  The second decides whether the selected coding
  * is applied.
  */
@@ -777,9 +999,9 @@ nxt_http_comp_below_min_len(nxt_off_t clen,
 
 
 static nxt_int_t
-nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
-                                nxt_http_request_t *r, const nxt_str_t *token,
-                                bool *identity_refused)
+nxt_http_comp_negotiate(const nxt_http_comp_conf_t *conf,
+                        nxt_http_request_t *r, const nxt_str_t *token,
+                        bool *identity_refused)
 {
     /*
      * What the field said about identity.  "identity_named" and
@@ -788,16 +1010,17 @@ nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
      * explicit token wins.  "named" records the enabled codings that the
      * field listed.  The wildcard does not stand for these codings.
      */
-    bool       identity_allowed = true;
-    bool       identity_named = false;
-    bool       identity_named_ok = false;
-    bool       wildcard_seen = false;
-    char       *str, *tkn, *tail, *cur;
-    double     weight = 0.0;
-    double     wildcard_qval = 0.0;
-    uint32_t   named = 0;
-    nxt_off_t  clen = nxt_http_comp_resp_length(r);
-    nxt_int_t  idx = NXT_HTTP_COMP_SCHEME_IDENTITY;
+    bool             identity_allowed = true;
+    bool             identity_named = false;
+    bool             identity_named_ok = false;
+    bool             wildcard_seen = false;
+    char             *str, *tkn, *tail, *cur;
+    double           weight = 0.0;
+    double           wildcard_qval = 0.0;
+    uint32_t         named = 0;
+    nxt_off_t        clen = nxt_http_comp_resp_length(r);
+    nxt_int_t        idx = NXT_HTTP_COMP_SCHEME_IDENTITY;
+    const nxt_str_t  *identity;
 
     *identity_refused = false;
 
@@ -835,6 +1058,8 @@ nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
     }
     *tail = '\0';
 
+    identity = &nxt_http_comp_compressors[NXT_HTTP_COMP_SCHEME_IDENTITY].token;
+
     while ((tkn = strsep(&str, ","))) {
         bool        wildcard;
         char        *qptr;
@@ -871,13 +1096,13 @@ nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
 
         /*
          * Identity says whether the own bytes of the response are
-         * acceptable.  That does not depend on the configured compressors.
-         * Read it before the lookup, so that a refusal still arrives when
-         * compression is off.  That is the one case where identity is all
-         * the server can offer.
+         * acceptable.  That does not depend on the configured compressors:
+         * it is recognised from the static table, so a refusal still
+         * arrives when compression is off.  That is the one case where
+         * identity is all the server can offer.  Read it before the lookup.
          */
 
-        if (nxt_http_comp_token_is_identity(&enc)) {
+        if (nxt_strcasestr_eq(&enc, identity)) {
             ecidx = NXT_HTTP_COMP_SCHEME_IDENTITY;
             identity_named = true;
             identity_named_ok = (qval != 0.0);
@@ -1005,6 +1230,75 @@ nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
 }
 
 
+/*
+ * Chooses the coding for the response, or returns -1 when the client refuses
+ * every coding that can be served.
+ *
+ * With compression off, identity is the only coding.  The client refuses it
+ * only with a weight of 0, and a weight comes after a ';'.  So an absent
+ * field or a value without a ';' always gives identity and refuses nothing,
+ * and the parse is not run.  A browser field such as "gzip, deflate, br,
+ * zstd" takes this path.  With compression on, a value without a ';' can
+ * still select a compressor, so the parse always runs.
+ */
+
+static nxt_int_t
+nxt_http_comp_select_compressor(const nxt_http_comp_conf_t *conf,
+                                nxt_http_request_t *r, const nxt_str_t *token,
+                                bool *identity_refused)
+{
+    if (conf == NULL
+        && (token->length == 0
+            || memchr(token->start, ';', token->length) == NULL))
+    {
+        *identity_refused = false;
+        return NXT_HTTP_COMP_SCHEME_IDENTITY;
+    }
+
+    return nxt_http_comp_negotiate(conf, r, token, identity_refused);
+}
+
+
+/*
+ * Matches on name_length + nxt_memcasecmp(), not nxt_strcasecmp(): a field
+ * name is length-tracked, and its NUL is not part of the type's contract.
+ */
+
+static void
+nxt_http_comp_skip_fields(nxt_http_request_t *r, const char *name,
+    size_t length)
+{
+    nxt_http_field_t  *f;
+
+    nxt_http_fields_each(f, r->resp.inline_fields, r->resp.num_inline_fields,
+                         r->resp.fields)
+    {
+        if (f->name_length == length
+            && nxt_memcasecmp(f->name, name, length) == 0)
+        {
+            f->skip = true;
+        }
+    } nxt_http_fields_loop;
+}
+
+
+/*
+ * A coded body is never served in ranges: a Range request gets identity
+ * bytes.  So a coded response does not advertise ranges.  Called after
+ * "response_headers", which can add the field too.  Only an applied coding
+ * counts, not a static range served as identity.
+ */
+
+void
+nxt_http_comp_drop_accept_ranges(nxt_http_request_t *r)
+{
+    if (nxt_http_comp_wants_compression(r)) {
+        nxt_http_comp_skip_fields(r, "Accept-Ranges",
+                                  nxt_length("Accept-Ranges"));
+    }
+}
+
+
 static nxt_int_t
 nxt_http_comp_set_header(const nxt_http_comp_conf_t *conf,
                          nxt_http_request_t *r, nxt_uint_t comp_idx)
@@ -1033,8 +1327,6 @@ nxt_http_comp_set_header(const nxt_http_comp_conf_t *conf,
     r->resp.content_length_n = -1;
 
     if (r->resp.mime_type == NULL) {
-        nxt_http_field_t *f;
-
         /*
          * As per RFC 2616 section 4.4 item 3, you should not send
          * Content-Length when a Transfer-Encoding header is present.
@@ -1042,42 +1334,13 @@ nxt_http_comp_set_header(const nxt_http_comp_conf_t *conf,
          * Skip every Content-Length, not just the first: leaving a second one
          * behind would emit an advertised body length alongside the chunked
          * framing this response now uses, which a downstream parser can use to
-         * re-frame the body.  Match on name_length + nxt_memcasecmp() rather
-         * than nxt_strcasecmp(): nxt_http_field_t carries a length-tracked
-         * name and only happens to be NUL-terminated on the paths that reach
-         * compression today (libunit-built app responses and static-file
-         * literals), which is not part of the type's contract.
+         * re-frame the body.
          */
-        nxt_http_fields_each(f, r->resp.inline_fields, r->resp.num_inline_fields,
-                             r->resp.fields)
-        {
-            if (f->name_length == nxt_length("Content-Length")
-                && nxt_memcasecmp(f->name, "Content-Length",
-                                  nxt_length("Content-Length")) == 0)
-            {
-                f->skip = true;
-            }
-        } nxt_http_fields_loop;
+        nxt_http_comp_skip_fields(r, "Content-Length",
+                                  nxt_length("Content-Length"));
     }
 
     return NXT_OK;
-}
-
-
-static bool
-nxt_http_comp_is_resp_content_encoded(const nxt_http_request_t *r)
-{
-    nxt_http_field_t  *f;
-
-    nxt_http_fields_each(f, r->resp.inline_fields, r->resp.num_inline_fields,
-                         r->resp.fields)
-    {
-        if (nxt_strcasecmp(f->name, (const u_char *)"Content-Encoding") == 0) {
-            return true;
-        }
-    } nxt_http_fields_loop;
-
-    return false;
 }
 
 
@@ -1310,6 +1573,7 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
     bool                      identity_refused;
     nxt_int_t                 ret, idx;
     nxt_str_t                 accept_encoding, mime_type = {};
+    nxt_http_field_t          *f;
     nxt_http_comp_ctx_t       *ctx;
     nxt_http_comp_conf_t      *conf = nxt_http_comp_request_conf(r);
     nxt_http_set_header_op_t  conf_op;
@@ -1320,11 +1584,39 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
      */
     r->comp_ctx = NULL;
 
-    if (r->resp.content_length == NULL && r->resp.content_length_n == -1) {
+    /*
+     * Compression off, no "response_headers" Content-Encoding, and no
+     * Accept-Encoding weight: every path below returns NXT_OK without a
+     * context, because nothing can refuse identity and nothing can code.
+     * So the response fields, the Content-Encoding scan and the joined
+     * Accept-Encoding value are not looked at.  Since every application
+     * response without Content-Length is negotiated, this is the common
+     * case.  A field with a ';' takes the full path, so "identity;q=0" and
+     * "*;q=0" are answered 406 as before.
+     */
+
+    if (conf == NULL
+        && (r->action == NULL || !r->action->set_headers_encoding)
+        && !nxt_http_comp_accept_encoding_has_weight(r))
+    {
         return NXT_OK;
     }
 
-    if (r->resp.content_length_n == 0) {
+    /*
+     * An empty body has nothing to code.  An application's
+     * "Content-Length: 0" is a field, not content_length_n, so it is read
+     * through the same function as the "min_length" test.  Before, such a
+     * response was coded to an empty stream, or refused with 406 for
+     * "identity;q=0".
+     *
+     * A body of unknown length (-1) is negotiated and coded like any other:
+     * it is sent chunked, and the last buffer of the response ends the
+     * stream.  "min_length" applies only to a known length, see
+     * nxt_http_comp_below_min_len().  Unknown length used to skip
+     * compression as well, so a streamed application response, and any PHP
+     * script that does not send Content-Length, was never compressed (#856).
+     */
+    if (nxt_http_comp_resp_length(r) == 0) {
         return NXT_OK;
     }
 
@@ -1347,9 +1639,26 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
         return NXT_OK;
     }
 
-    if (nxt_http_comp_is_resp_content_encoded(r)) {
-        return NXT_OK;
-    }
+    /*
+     * A Content-Encoding on the response means the application coded the
+     * body itself.  Unit does not code it again.
+     *
+     * The length test only skips names that cannot match.  libunit and the
+     * static handler put a NUL at name_length, and nxt_strcasecmp() stops
+     * at the first NUL.  The router does not check that NUL.  The compare
+     * is kept, so a name with a NUL inside gives the same result as before.
+     */
+
+    nxt_http_fields_each(f, r->resp.inline_fields, r->resp.num_inline_fields,
+                         r->resp.fields)
+    {
+        if (f->name_length >= nxt_length("Content-Encoding")
+            && nxt_strcasecmp(f->name, (const u_char *) "Content-Encoding")
+               == 0)
+        {
+            return NXT_OK;
+        }
+    } nxt_http_fields_loop;
 
     /*
      * "response_headers" are applied after this, when the header is sent.
@@ -1373,8 +1682,7 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
      * absent.
      */
 
-    conf_op = nxt_http_set_headers_field_op(r, "Content-Encoding",
-                                            nxt_length("Content-Encoding"));
+    conf_op = nxt_http_set_headers_encoding_op(r);
 
     if (nxt_slow_path(conf_op == NXT_HTTP_SET_HEADER_ERROR)) {
         return NXT_ERROR;
@@ -1416,6 +1724,17 @@ nxt_http_comp_check_acceptable(nxt_task_t *task, nxt_http_request_t *r)
 
     if (conf == NULL) {
         return NXT_OK;
+    }
+
+    /*
+     * An application's 206 carries its own Content-Range, which counts the
+     * bytes of the identity body.  A coded body would not match it, so a
+     * 206 is not coded, as in nginx.  The static path asks while the
+     * status is still 200, and does not code a range itself.
+     */
+
+    if (r->status == NXT_HTTP_PARTIAL_CONTENT) {
+        return identity_refused ? nxt_http_comp_not_acceptable(r) : NXT_OK;
     }
 
     if (r->resp.mime_type != NULL) {
@@ -1545,8 +1864,8 @@ nxt_http_comp_weaken_etag(nxt_http_request_t *r)
 
 /*
  * Applies the decision nxt_http_comp_check_acceptable() reached: adds the
- * Content-Encoding header and initialises the compressor.  Call it only on a
- * path that will actually send a body.
+ * Content-Encoding header and initialises the compressor.  Call it on a path
+ * that sends a body, or for HEAD, which must carry the same fields as GET.
  */
 
 nxt_int_t
@@ -1590,6 +1909,7 @@ nxt_http_comp_apply_compression(nxt_task_t *task, nxt_http_request_t *r)
     ctx->idx = idx;
     ctx->type = compressor->type;
     ctx->ctx.level = compressor->opts.level;
+    ctx->ctx.size_hint = ctx->resp_clen;
 
     /*
      * Registered before the stream exists, so that no stream is left without
@@ -1765,3 +2085,106 @@ nxt_http_comp_compression_init(nxt_task_t *task, nxt_router_conf_t *rtcf,
 
     return NXT_OK;
 }
+
+
+#if (NXT_TESTS)
+
+/*
+ * For src/test/nxt_tests.c: the name test of the scan in
+ * nxt_http_comp_accept_encoding().
+ */
+
+bool
+nxt_http_comp_test_accept_encoding_name(const u_char *name, size_t length)
+{
+    return length == nxt_length("Accept-Encoding")
+           && nxt_http_comp_is_accept_encoding(name);
+}
+
+
+/*
+ * For src/test/nxt_http_comp_select_test.c.  With "compression" set, every
+ * coding of this build is enabled once, with "min_len" for each compressor.
+ * With "negotiate" set, the full parse runs and the shortcut is not used.
+ */
+
+nxt_int_t
+nxt_http_comp_test_select(nxt_http_request_t *r, const nxt_str_t *value,
+    nxt_bool_t compression, nxt_off_t min_len, nxt_bool_t negotiate,
+    bool *identity_refused)
+{
+    nxt_uint_t                  i;
+    nxt_http_comp_conf_t        conf, *cp;
+    nxt_http_comp_compressor_t  enabled[NXT_NR_COMPRESSORS];
+
+    for (i = 0; i < NXT_NR_COMPRESSORS; i++) {
+        enabled[i].type = &nxt_http_comp_compressors[i];
+        enabled[i].opts.level = nxt_http_comp_compressors[i].def_compr;
+        enabled[i].opts.min_len = (i == 0) ? -1 : min_len;
+    }
+
+    conf.mime_types_rule = NULL;
+    conf.enabled = enabled;
+    conf.nr_enabled = NXT_NR_COMPRESSORS;
+
+    cp = compression ? &conf : NULL;
+
+    if (negotiate) {
+        return nxt_http_comp_negotiate(cp, r, value, identity_refused);
+    }
+
+    return nxt_http_comp_select_compressor(cp, r, value, identity_refused);
+}
+
+
+/*
+ * For src/test/nxt_http_comp_select_test.c: the compression-off shortcut of
+ * nxt_http_comp_check_acceptable().  The value is put into the request as
+ * one Accept-Encoding field, or as two when "split" falls inside it.  Gives
+ * whether the shortcut is taken, and what the full parse of the joined
+ * value says with compression off.
+ */
+
+nxt_int_t
+nxt_http_comp_test_off_shortcut(nxt_http_request_t *r, const nxt_str_t *value,
+    size_t split, bool *shortcut, bool *identity_refused)
+{
+    nxt_int_t         ret;
+    nxt_str_t         joined;
+    nxt_http_field_t  *f;
+
+    static u_char  name[] = "accept-ENCODING";
+
+    r->num_inline_fields = 0;
+    r->fields = NULL;
+
+    f = &r->inline_fields[r->num_inline_fields++];
+    *f = (nxt_http_field_t) { .name = name,
+                              .name_length = nxt_length("Accept-Encoding"),
+                              .value = value->start,
+                              .value_length = value->length };
+
+    if (split > 0 && split < value->length) {
+        f->value_length = split;
+
+        f = &r->inline_fields[r->num_inline_fields++];
+        *f = (nxt_http_field_t) { .name = name,
+                                  .name_length = nxt_length("Accept-Encoding"),
+                                  .value = value->start + split,
+                                  .value_length = value->length - split };
+    }
+
+    *shortcut = !nxt_http_comp_accept_encoding_has_weight(r);
+
+    ret = nxt_http_comp_accept_encoding(r, &joined);
+
+    if (ret == NXT_OK) {
+        ret = nxt_http_comp_negotiate(NULL, r, &joined, identity_refused);
+    }
+
+    r->num_inline_fields = 0;
+
+    return ret;
+}
+
+#endif

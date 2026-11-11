@@ -200,6 +200,17 @@ nxt_app_type_t nxt_app_parse_type(u_char *p, size_t length);
 void nxt_proto_test_run_start_process_handler(nxt_task_t *task,
     nxt_port_recv_msg_t *msg);
 void nxt_proto_test_set_exiting(nxt_bool_t exiting);
+/*
+ * Drive a message through the prototype or discovery port handler table, and
+ * read the counters nxt_app_gate_handler() keeps; see
+ * src/test/nxt_app_gate_test.c.
+ */
+void nxt_app_test_run_proto_port_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+void nxt_app_test_run_discovery_port_handler(nxt_task_t *task,
+    nxt_port_recv_msg_t *msg);
+nxt_uint_t nxt_app_test_gate_accepted(void);
+nxt_uint_t nxt_app_test_gate_refused(void);
 #endif
 
 NXT_EXPORT extern nxt_str_t  nxt_server;
@@ -212,5 +223,28 @@ NXT_EXPORT nxt_int_t nxt_app_set_logs(void);
 
 /* Reports a reaped child of the prototype; see nxt_proto_sigchld_handler(). */
 void nxt_proto_child_exited(nxt_task_t *task, nxt_process_t *process);
+
+
+/*
+ * libunit takes the "shm" limit as a uint32_t: nxt_unit_default_init() and
+ * nxt_external_start() pass it on.  The validator refuses a larger "shm",
+ * but a stored configuration can still have one.  A stored negative "shm"
+ * becomes a large size_t: nxt_conf_map_object() converts it to ssize_t, and
+ * -1 is stored as SIZE_MAX.  Such an application gets the largest limit,
+ * not the low 32 bits of the number.
+ */
+
+nxt_inline size_t
+nxt_app_shm_limit(size_t limit)
+{
+#if (NXT_SIZE_T_SIZE > 4)
+    if (limit > UINT32_MAX) {
+        return UINT32_MAX;
+    }
+#endif
+
+    return limit;
+}
+
 
 #endif /* _NXT_APPLICATION_H_INCLIDED_ */

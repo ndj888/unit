@@ -1,3 +1,5 @@
+import socket
+
 import pytest
 
 from unit.applications.lang.python import ApplicationPython
@@ -549,3 +551,143 @@ def test_http_header_fields_keepalive_spill():
             assert f'HTTP_X_TEST_{i}' in got, f'keep-alive field {i} of {count}'
 
     sock.close()
+
+
+def test_http_header_large_buffers_above_255():
+    # The parser rewinds only to the start of an incomplete field, so a
+    # header of many short fields takes one large buffer for every few
+    # fields.  The first buffer has the default size of 2048 bytes and holds
+    # about 68 fields.  With 128-byte large buffers and 30-byte fields, 4
+    # fields fit in one buffer, so 1200 fields take about 283 large buffers
+    # and 1350 fields take about 320.  The count of
+    # buffers was 8 bits wide, so a limit of 256 or more never fired.
+    client.load('empty')
+
+    assert 'success' in client.conf(
+        {
+            'http': {
+                'large_header_buffer_size': 128,
+                'large_header_buffers': 300,
+            }
+        },
+        'settings',
+    )
+
+    def fields(count, expect):
+        headers = {'Host': 'localhost', 'Connection': 'close'}
+        for i in range(count):
+            headers[f'X-{i:04}'] = 'a' * 20
+
+        assert client.get(headers=headers)['status'] == expect, count
+
+    fields(1200, 200)
+    fields(1350, 431)
+
+
+def connection_exchange(version, lines):
+    """Send a request with the "Connection" field lines "lines", read its
+    response, then send a second request on the same socket.
+
+    Return the head of the first response, in lower case, and the first
+    bytes of the answer to the second request.  An empty answer means that
+    the server closed the connection after the first response: the read gave
+    EOF, or the socket was reset.  A server that neither answers nor closes
+    within 10 seconds fails the test.
+    """
+    request = f'GET / HTTP/{version}\r\nHost: localhost\r\n'
+
+    for line in lines:
+        request += f'Connection: {line}\r\n'
+
+    sock = client.http(f'{request}\r\n'.encode(), raw=True, no_recv=True)
+
+    try:
+        first = client.recvall(sock, framed=True, read_timeout=10)
+
+        # recvall() also returns b'' when its read_timeout ends, so the
+        # second answer is read with the timeout of the socket.
+        sock.settimeout(10)
+
+        try:
+            sock.sendall(
+                b'GET / HTTP/1.1\r\nHost: localhost\r\n'
+                b'Connection: close\r\n\r\n'
+            )
+            second = sock.recv(4096)
+
+        except socket.timeout:
+            pytest.fail('no answer and no close in 10 seconds')
+
+        except OSError:
+            # The server closed the connection, and the socket was reset.
+            second = b''
+
+    finally:
+        sock.close()
+
+    return first.partition(b'\r\n\r\n')[0].lower(), second
+
+
+@pytest.mark.parametrize(
+    'version, lines, keep',
+    [
+        # RFC 9112, 9.6: "close" closes the connection, also when the
+        # request has "keep-alive" too, in one field line or in two.
+        pytest.param('1.1', ['close, keep-alive'], False, id='close-first'),
+        pytest.param('1.1', ['keep-alive, close'], False, id='close-last'),
+        pytest.param('1.1', ['close', 'keep-alive'], False, id='lines'),
+        pytest.param('1.1', ['keep-alive', 'close'], False, id='lines-close'),
+        pytest.param('1.0', ['close, keep-alive'], False, id='http10'),
+        # RFC 9110, 5.6.1: spaces and tabs around an element, and empty
+        # elements.
+        pytest.param('1.1', ['  close ,'], False, id='ows'),
+        pytest.param('1.1', [',\tClose\t, ,'], False, id='ows-tab'),
+        # RFC 9110, 7.6.1: only a whole token is an option.
+        pytest.param('1.1', ['X-Closer'], True, id='x-closer'),
+        pytest.param('1.0', ['Keep-Alive-Extension'], False, id='ka-ext'),
+        pytest.param('1.0', ['keep-alive'], True, id='ka'),
+        pytest.param('1.0', ['KEEP-ALIVE'], True, id='ka-upper'),
+        pytest.param('1.0', ['TE, Keep-Alive'], True, id='ka-list'),
+    ],
+)
+def test_http_header_connection(version, lines, keep):
+    client.load('empty')
+
+    head, second = connection_exchange(version, lines)
+
+    assert head.startswith(b'http/1.1 200 '), head
+
+    connection = [
+        line
+        for line in head.split(b'\r\n')
+        if line.startswith(b'connection:')
+    ]
+
+    # The response names only what differs from the default of the version.
+    if version == '1.1':
+        assert connection == ([] if keep else [b'connection: close'])
+
+    else:
+        assert connection == ([b'connection: keep-alive'] if keep else [])
+
+    if keep:
+        assert second.startswith(b'HTTP/1.1 200 '), 'second request answered'
+
+    else:
+        assert second == b'', 'connection closed after the first response'
+
+
+def test_http_header_connection_upgrade_token():
+    # "upgrade" inside a longer token is not the "upgrade" option, so this
+    # request is no WebSocket handshake.
+    client.load('empty')
+
+    resp = client.get(
+        headers={
+            'Host': 'localhost',
+            'Connection': 'X-Upgrade-Info, close',
+            'Upgrade': 'websocket',
+        }
+    )
+
+    assert resp['status'] == 200, 'not a handshake'

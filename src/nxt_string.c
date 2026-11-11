@@ -187,13 +187,17 @@ nxt_strncasecmp(const u_char *s1, const u_char *s2, size_t length)
         c1 = *s1++;
         c2 = *s2++;
 
-        c1 = nxt_lowcase(c1);
-        c2 = nxt_lowcase(c2);
+        /* Equal bytes need no case folding. */
 
-        n = c1 - c2;
+        if (c1 != c2) {
+            c1 = nxt_lowcase(c1);
+            c2 = nxt_lowcase(c2);
 
-        if (n != 0) {
-            return n;
+            n = c1 - c2;
+
+            if (n != 0) {
+                return n;
+            }
         }
 
         if (c1 == 0) {
@@ -219,13 +223,17 @@ nxt_memcasecmp(const void *p1, const void *p2, size_t length)
         c1 = *s1++;
         c2 = *s2++;
 
-        c1 = nxt_lowcase(c1);
-        c2 = nxt_lowcase(c2);
+        /* Equal bytes need no case folding. */
 
-        n = c1 - c2;
+        if (c1 != c2) {
+            c1 = nxt_lowcase(c1);
+            c2 = nxt_lowcase(c2);
 
-        if (n != 0) {
-            return n;
+            n = c1 - c2;
+
+            if (n != 0) {
+                return n;
+            }
         }
     }
 
@@ -341,18 +349,20 @@ nxt_rmemstrn(const u_char *s, const u_char *end, const char *ss, size_t length)
 }
 
 
-size_t
-nxt_str_strip(const u_char *start, u_char *end)
-{
-    u_char  *p;
+/* The length of the string without trailing CR, LF, SP and HTAB. */
 
-    for (p = end - 1; p >= start; p--) {
-        if (*p != '\r' && *p != '\n') {
+size_t
+nxt_str_strip(const u_char *start, const u_char *end)
+{
+    const u_char  *p;
+
+    for (p = end; p != start; p--) {
+        if (p[-1] != '\r' && p[-1] != '\n' && p[-1] != ' ' && p[-1] != '\t') {
             break;
         }
     }
 
-    return (p + 1) - start;
+    return p - start;
 }
 
 

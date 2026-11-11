@@ -97,16 +97,24 @@ single `grep` finds every side of a case. E.g. token `chunked_response`:
 | 7997 | `slow_drip` | `slow-drip` | `respond_slow_drip` | `test_proxy_chunked_response_slow_drip` (#72 case 5) |
 | 7998 | `dup_te` | `dup-te` | `respond_dup_te` | `test_proxy_chunked_response_dup_te` (#72 case 6, nginx/unit#1088) |
 
-> **7999 is not available here.** `test/test_proxy.py` and `test/test_proxy_chunked.py`
-> already bind `SERVER_PORT = 7999` for their own upstream, so this registry ends at
+> **7999 is not available here.** `test/test_proxy.py`, `test/test_proxy_chunked.py`,
+> `test/test_proxy_status_line.py` and `test/test_proxy_rewrite_target.py` already
+> bind port 7999 for their own upstream, so this registry ends at
 > 7998. New `fake_upstream` slots go to the 7974–7975 gap (7976 is taken by
 > `test_proxy_te.py` and 7977 by `test_proxy_interim.py` above, 7978–7979 are
 > taken above, 7980–7982 are `fake_otlp`).
+>
+> `--port` (see `test/unit/port.py`) moves 7976–7999 together with the
+> listeners, so two test runs can use different bases at the same time. A test
+> reads its port through `port_map.port()`. A new slot below 7976 must also be
+> added to `LITERALS` in `test/unit/port.py`; `test_port_map.py` checks that
+> every port in this table is in the map, and `unit/port_lint.py` refuses a
+> `port_map.port()` call with a port that is not.
 
 A test pins its port as a module constant referencing this table:
 
 ```python
-UPSTREAM_PORT = 7994                       # reserved here for #72
+UPSTREAM_PORT = port_map.port(7994)        # reserved here for #72
 proc = _run_chunked_response()             # --mode chunked-response --size 64
 try:
     client.conf({... "proxy": f"http://127.0.0.1:{UPSTREAM_PORT}" ...})

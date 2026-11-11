@@ -1,9 +1,9 @@
 # About this fork
-`ndj888/unit` is a maintained fork of NGINX Unit.
-Since 1.37.0, this fork tracks [FreeUnit](https://github.com/freeunitorg/freeunit) as its upstream.
-The only fork-specific patch is the PHP `UNIT_REWRITTEN_PATH` server variable ([nginx/unit#1615](https://github.com/nginx/unit/issues/1615)).
-Find releases at [ndj888/unit/releases](https://github.com/ndj888/unit/releases).
-See [FORK-MAINTENANCE.md](FORK-MAINTENANCE.md) for the Chinese maintenance manual.
+
+`ndj888/unit` tracks [FreeUnit](https://github.com/freeunitorg/freeunit), the maintained continuation of NGINX Unit.
+`master` mirrors upstream `master` exactly. `codex/develop` retains this fork's history, current upstream code, and the latest personal changes.
+The development branch includes PHP `UNIT_REWRITTEN_PATH` ([FreeUnit #829](https://github.com/freeunitorg/freeunit/pull/829)) and rejection of unencoded spaces in request targets ([FreeUnit #970](https://github.com/freeunitorg/freeunit/pull/970)). Their original PR branches remain separate.
+See [FORK-MAINTENANCE.md](FORK-MAINTENANCE.md) for branch synchronization, validation, and historical release/deployment records.
 
 # FreeUnit — Community LTS fork of Unit
 
@@ -63,13 +63,13 @@ and are available for `linux/amd64` and `linux/arm64`.
 | PHP 8.5 | `ghcr.io/freeunitorg/freeunit:latest-php-8.5` |
 | PHP 8.4 | `ghcr.io/freeunitorg/freeunit:latest-php-8.4` |
 | PHP 8.3 | `ghcr.io/freeunitorg/freeunit:latest-php-8.3` |
+| Python 3.15 | `ghcr.io/freeunitorg/freeunit:latest-python-3.15` |
 | Python 3.14 | `ghcr.io/freeunitorg/freeunit:latest-python-3.14` |
 | Python 3.13 | `ghcr.io/freeunitorg/freeunit:latest-python-3.13` |
 | Python 3.12 | `ghcr.io/freeunitorg/freeunit:latest-python-3.12` |
 | Node.js 26 | `ghcr.io/freeunitorg/freeunit:latest-node-26` |
 | Node.js 24 | `ghcr.io/freeunitorg/freeunit:latest-node-24` |
 | Node.js 22 | `ghcr.io/freeunitorg/freeunit:latest-node-22` |
-| Node.js 20 | `ghcr.io/freeunitorg/freeunit:latest-node-20` |
 | Go 1.27 | `ghcr.io/freeunitorg/freeunit:latest-go-1.27` |
 | Go 1.26 | `ghcr.io/freeunitorg/freeunit:latest-go-1.26` |
 | Go 1.25 | `ghcr.io/freeunitorg/freeunit:latest-go-1.25` |
@@ -80,6 +80,22 @@ and are available for `linux/amd64` and `linux/arm64`.
 Full list of variants (including `python-3.14`, `perl-5.40`, `ruby-3.3`, slim
 Python variants, etc.) is in the
 [docker workflow](.github/workflows/release-docker.yml).
+
+#### Scheduled images for unreleased PHP
+
+FreeUnit master is also built on a schedule for PHP versions that have no
+release image yet, and published to GHCR only:
+
+| Variant | Built | Image |
+|---------|-------|-------|
+| PHP 8.6 (RC until 8.6.0) | every night | `ghcr.io/freeunitorg/freeunit:nightly-php-8.6` |
+| PHP 8.7 (php-src master) | every Monday | `ghcr.io/freeunitorg/freeunit:weekly-php-8.7` |
+
+Each build also has a dated tag, for example `nightly-php-8.6-20261102`.
+These images are `linux/amd64` only, follow the current development code
+of both FreeUnit and PHP, and are not for production.  Their labels name
+the FreeUnit commit, the base image and, for 8.7, the php-src commit.  See
+[the workflow](.github/workflows/docker-nightly.yml).
 
 ```console
 $ docker pull ghcr.io/freeunitorg/freeunit:latest-minimal
@@ -162,6 +178,13 @@ FreeUnit includes built-in OpenTelemetry support (compiled with `--otel`):
   }
 }
 ```
+
+## USDT Probes
+
+`./configure --usdt` adds static probes for bpftrace, perf and SystemTap.
+They trace port messages, the app queue, process starts and requests.
+[docs/usdt.md](docs/usdt.md) lists them, and [tools/usdt/](tools/usdt/) has
+bpftrace scripts.
 
 ## WebAssembly
 

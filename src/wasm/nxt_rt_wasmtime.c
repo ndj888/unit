@@ -61,13 +61,34 @@ nxt_wasmtime_err_msg(wasmtime_error_t *error, wasm_trap_t *trap,
 /*
  * memory.grow can move the linear memory to a new address.  Read the base
  * again after the guest has run, and before an import function reads or
- * writes the memory.
+ * writes the memory.  The value is valid only until the guest runs again.
  */
 static void
 nxt_wasmtime_update_baddr(nxt_wasm_ctx_t *ctx, wasmtime_context_t *wctx)
 {
     ctx->baddr = wasmtime_memory_data(wctx, &nxt_wasmtime_ctx.memory)
                  + ctx->baddr_off;
+}
+
+
+/*
+ * The guest can call an import before the host serves a request: from its
+ * start function or "_initialize" in wasmtime_linker_module(), from the
+ * malloc handler, or from the module_init hook.  The host has no request to
+ * answer then.  Before nxt_wasmtime_init_memory() it also has no handle for
+ * the memory.  An import that needs a request traps in that case.  The host
+ * serves a request only after nxt_wasmtime_init() succeeds, so a request
+ * implies a memory handle.  The host clears ctx->req when the request
+ * completes, so NULL means no live request.
+ */
+static wasm_trap_t *
+nxt_wasmtime_check_request(const nxt_wasm_ctx_t *ctx, const char *msg)
+{
+    if (ctx->req != NULL) {
+        return NULL;
+    }
+
+    return wasmtime_trap_new(msg, strlen(msg));
 }
 
 
@@ -87,6 +108,14 @@ nxt_wasm_response_end(void *env, wasmtime_caller_t *caller,
                       const wasmtime_val_t *args, size_t nargs,
                       wasmtime_val_t *results, size_t nresults)
 {
+    wasm_trap_t  *trap;
+
+    trap = nxt_wasmtime_check_request(env, "nxt_wasm_response_end() called "
+                                      "outside a request");
+    if (trap != NULL) {
+        return trap;
+    }
+
     nxt_wasm_do_response_end(env);
 
     return NULL;
@@ -98,6 +127,14 @@ nxt_wasm_send_response(void *env, wasmtime_caller_t *caller,
                        const wasmtime_val_t *args, size_t nargs,
                        wasmtime_val_t *results, size_t nresults)
 {
+    wasm_trap_t  *trap;
+
+    trap = nxt_wasmtime_check_request(env, "nxt_wasm_send_response() called "
+                                      "outside a request");
+    if (trap != NULL) {
+        return trap;
+    }
+
     nxt_wasmtime_update_baddr(env, wasmtime_caller_context(caller));
 
     nxt_wasm_do_send_response(env, args[0].of.i32);
@@ -111,6 +148,14 @@ nxt_wasm_send_headers(void *env, wasmtime_caller_t *caller,
                       const wasmtime_val_t *args, size_t nargs,
                       wasmtime_val_t *results, size_t nresults)
 {
+    wasm_trap_t  *trap;
+
+    trap = nxt_wasmtime_check_request(env, "nxt_wasm_send_headers() called "
+                                      "outside a request");
+    if (trap != NULL) {
+        return trap;
+    }
+
     nxt_wasmtime_update_baddr(env, wasmtime_caller_context(caller));
 
     nxt_wasm_do_send_headers(env, args[0].of.i32);
@@ -281,6 +326,14 @@ nxt_wasmtime_get_function_exports(nxt_wasm_ctx_t *ctx)
                                  ctx->fh[i].func_name);
             return -1;
         }
+
+        if (item.kind != WASMTIME_EXTERN_FUNC) {
+            nxt_wasmtime_err_msg(NULL, NULL,
+                                 "module export (%s) is not a function",
+                                 ctx->fh[i].func_name);
+            return -1;
+        }
+
         ctx->fh[i].func = item.of.func;
     }
 

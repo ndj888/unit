@@ -9,7 +9,7 @@
  * failed" sites in nxt_router_start_app_process_handler():
  *
  *   site 1  the prototype buffer allocation, forced by an app conf length
- *           no allocator can satisfy;
+ *           that makes nxt_mp_alloc() refuse the request;
  *   site 2  nxt_port_rpc_register_handler_ex(), forced by the NXT_TESTS
  *           rpc allocation hook;
  *   site 3  nxt_port_socket_write2(), forced by the NXT_TESTS port message
@@ -159,6 +159,7 @@ nxt_router_start_fail_soak_test(nxt_thread_t *thr)
     nxt_queue_init(&app->spare_ports);
     nxt_queue_init(&app->idle_ports);
     nxt_queue_init(&app->ack_waiting_req);
+    nxt_queue_init(&app->requeue_req);
 
     nxt_str_set(&app->name, "start-fail-soak-test");
 
@@ -184,12 +185,20 @@ nxt_router_start_fail_soak_test(nxt_thread_t *thr)
         if (site == 0) {
             /*
              * Site 1: no prototype, so the handler builds the START_PROCESS
-             * payload first.  A length no allocator can serve makes
-             * nxt_buf_mem_alloc() return NULL before the buffer is written
-             * to, so app->conf may stay empty.
+             * payload first.  It asks nxt_buf_mem_alloc() for name, NUL and
+             * conf, and nxt_buf_mem_alloc() adds NXT_BUF_MEM_SIZE.  This
+             * length makes that request exactly 0xFFFFFFFF on every width.
+             * nxt_mp_alloc_large() refuses a size of 0xFFFFFFFF or more
+             * before it calls the allocator, so the buffer is never written
+             * to and app->conf may stay empty.
+             *
+             * On a 32-bit size_t 0xFFFFFFFF is SIZE_MAX, so this is the one
+             * length that makes nxt_mp_alloc_large() refuse the request on
+             * every width.
              */
             app->proto_port = NULL;
-            app->conf.length = (size_t) 1 << 46;
+            app->conf.length = (size_t) 0xFFFFFFFF - NXT_BUF_MEM_SIZE
+                               - app->name.length - 1;
 
         } else {
             app->proto_port = dport;
@@ -211,7 +220,7 @@ nxt_router_start_fail_soak_test(nxt_thread_t *thr)
         if (app->pending_processes != baseline) {
             nxt_log_error(NXT_LOG_NOTICE, thr->log,
                           "router start fail soak test: iteration %ui site %ui "
-                          "pending_processes %uD (expected %uD)",
+                          "pending_processes %uA (expected %uD)",
                           i, site + 1, app->pending_processes, baseline);
             goto done;
         }
@@ -243,7 +252,7 @@ nxt_router_start_fail_soak_test(nxt_thread_t *thr)
     if (!nxt_router_app_can_start(app)) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router start fail soak test: app cannot start after "
-                      "%d failures, processes %uD pending %uD",
+                      "%d failures, processes %uA pending %uA",
                       NXT_ROUTER_START_FAIL_SOAK_N, app->processes,
                       app->pending_processes);
         goto done;
@@ -262,7 +271,7 @@ nxt_router_start_fail_soak_test(nxt_thread_t *thr)
     if (app->pending_processes != 1 || joint->use_count != 2) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
                       "router start fail soak test: successful start left "
-                      "pending %uD joint %uD (expected 1 and 2)",
+                      "pending %uA joint %uD (expected 1 and 2)",
                       app->pending_processes, joint->use_count);
         goto done;
     }
@@ -277,7 +286,7 @@ nxt_router_start_fail_soak_test(nxt_thread_t *thr)
 
     if (app->pending_processes != 0 || joint->use_count != 1) {
         nxt_log_error(NXT_LOG_NOTICE, thr->log,
-                      "router start fail soak test: release left pending %uD "
+                      "router start fail soak test: release left pending %uA "
                       "joint %uD (expected 0 and 1)",
                       app->pending_processes, joint->use_count);
         goto done;

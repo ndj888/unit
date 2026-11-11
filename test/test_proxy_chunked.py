@@ -11,11 +11,12 @@ import pytest
 from conftest import run_process
 from unit.applications.lang.python import ApplicationPython
 from unit.utils import waitforsocket
+from unit import port as port_map
 
 prerequisites = {'modules': {'python': 'any'}}
 
 client = ApplicationPython()
-SERVER_PORT = 7999
+SERVER_PORT = port_map.port(7999)
 
 
 @pytest.fixture(autouse=True)
@@ -226,6 +227,15 @@ def test_proxy_chunked_invalid():
     # grammar check be removed without any test noticing.
     resp = get_http10(body='\r\n\r\n0\r\nX')
     assert resp['status'] == 502, 'colonless trailer'
+
+    # A chunk extension that is not valid syntax (RFC 9112 7.1.1) is a
+    # framing error as well.  freeunitorg/freeunit#916.
+    resp = get_http10(body='\r\n\r\n5;\r\nhello\r\n0\r\n\r\n')
+    assert resp['status'] == 502, 'bare ";" in a chunk extension'
+
+    resp = get_http10(body='\r\n\r\n5;a="b \\" c";d\r\nhello\r\n0\r\n\r\n')
+    assert resp['status'] == 200, 'valid chunk extensions'
+    assert resp['body'] == 'hello', 'valid chunk extensions'
 
     resp = get_http10(body='\r\n\r\n65#\r\nA X 100')
     assert resp['status'] == 200, 'incomplete chunk status'

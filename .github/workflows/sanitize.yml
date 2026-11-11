@@ -64,7 +64,7 @@ concurrency:
 jobs:
   sanitize:
     name: "sanitize (${{ matrix.runtime }})"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 40
 
     # NOTE: `continue-on-error` is deliberately NOT set at job level here.
@@ -148,6 +148,21 @@ jobs:
             # A floor closes the connection from a read or a write handler,
             # in the middle of a body or a response.  It also has a TLS case,
             # which this leg runs because it is configured with --openssl.
+            #
+            # test_python_targets is here for its "pass" with variables cases.
+            # For each such request, a router thread allocates the action conf
+            # of the application.  If that allocation goes back to
+            # rtcf->mem_pool, the pool of the thread that loads the
+            # configuration, only nxt_mp_thread_assert() aborts on it, and only
+            # a --debug build has that check.  It is not a memory error, so
+            # ASan does not report it, and in a release build it shows only as
+            # memory that is kept until the next reconfiguration.  The
+            # build-test legs that run test_python_targets.py are release
+            # builds, so this leg is the only gate that catches it.
+            #
+            # test_settings_body_temp_path is here because the old code read
+            # "body_temp_path" from released memory.  Only a --debug build
+            # fills that memory, so only this leg makes the test fail.
             tests: >-
               test/test_graceful_reload.py
               test/test_state_store.py
@@ -160,6 +175,8 @@ jobs:
               test/test_app_lifecycle.py
               test/test_configuration.py
               test/test_settings.py
+              test/test_python_targets.py
+              test/test_settings_body_temp_path.py
           - runtime: php
             apt: ""
             configure: php
@@ -201,10 +218,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # A stalled mirror must fail the step, not the job. Apt retries 3 times
+      # and treats 30 s without data as a stall. Later apt commands use this.
+      # Each job writes its own copy: jobs cannot share a step.
+      - name: Bound apt waits
+        run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-ci-bounds
+
       # Base tools + pytest (needed to run any leg) plus this runtime's extra
       # apt packages.  Runtimes whose toolchain is not in apt add a setup step
       # instead (see PHP below) and leave `apt` empty.
       - name: Install packages
+        timeout-minutes: 5
         run: |
           sudo apt-get -y update
           sudo apt-get -y install build-essential libpcre2-dev libssl-dev \
@@ -250,11 +276,23 @@ jobs:
         env:
           ASAN_OPTIONS: "detect_leaks=0"
         run: |
+          # gcc: this leg sanitizes the runtimes, the C-core leg above runs both
+          # compilers over the unit tests.  Spelled out rather than inherited from
+          # the image, so a change of default compiler is a change of coverage and
+          # has to be made here.
+          #
+          # UBSan stays recoverable here, unlike in c-tests-asan: the allowlist
+          # this leg's gate reads is a post-hoc log scan, so aborting on the first
+          # report would fail a job for a violation the list waives, and would kill
+          # an exec'd app worker mid-response (the reason halt_on_error is not set
+          # above either).  c-tests-asan has no allowlist, which is why it can and
+          # does fail fast.
           ./configure \
+            --cc=gcc \
             --debug \
             --tests \
             --openssl \
-            --cc-opt="-fsanitize=address,undefined -fno-omit-frame-pointer -O1" \
+            --cc-opt="-fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g" \
             --ld-opt="-fsanitize=address,undefined"
 
       - name: Make unit
@@ -319,6 +357,7 @@ jobs:
       # below scans.  pytest_opts is per-runtime (e.g. --restart for the
       # graceful tests).
       - name: Run ${{ matrix.runtime }} sanitizer subset
+        timeout-minutes: 10
         continue-on-error: ${{ matrix.experimental == true }}
         # TZ: same pin as build-test.yml's pytest step, and for the same
         # reason (see its comment) -- without it this leg's
