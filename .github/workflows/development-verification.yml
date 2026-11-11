@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 env:
-  SOURCE_SHA: 45012d7c460fe93ef34172dd8d0ce01f0ef8e6da
+  SOURCE_SHA: 00ccf17a8634f5f6a8713d2db4e73fffae454e43
   BASELINE_SHA: fb8cd508da26dcf071b039631b70305bd3862de2
 
 defaults:
@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: ndj888/unit
-          ref: 45012d7c460fe93ef34172dd8d0ce01f0ef8e6da
+          ref: 00ccf17a8634f5f6a8713d2db4e73fffae454e43
           fetch-depth: 0
           persist-credentials: false
       - name: Assert exact source and record coverage
@@ -256,7 +256,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: ndj888/unit
-          ref: 45012d7c460fe93ef34172dd8d0ce01f0ef8e6da
+          ref: 00ccf17a8634f5f6a8713d2db4e73fffae454e43
           fetch-depth: 0
           persist-credentials: false
       - name: Assert exact source and compile strict core
@@ -342,7 +342,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: ndj888/unit
-          ref: 45012d7c460fe93ef34172dd8d0ce01f0ef8e6da
+          ref: 00ccf17a8634f5f6a8713d2db4e73fffae454e43
           fetch-depth: 0
           persist-credentials: false
       - name: Assert exact source and build sanitizer C suite
@@ -405,7 +405,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: ndj888/unit
-          ref: 45012d7c460fe93ef34172dd8d0ce01f0ef8e6da
+          ref: 00ccf17a8634f5f6a8713d2db4e73fffae454e43
           fetch-depth: 0
           persist-credentials: false
       - name: Assert exact source and build public clang-ast plugin
@@ -459,14 +459,14 @@ jobs:
 
 
   php-latest:
-    name: PHP latest runtime
+    name: PHP 8.5 runtime
     runs-on: ubuntu-26.04
     timeout-minutes: 35
     container:
-      image: debian:testing
+      image: debian:trixie
       options: --privileged
     steps:
-      - name: Install latest Debian PHP embed and test dependencies
+      - name: Install build and test dependencies
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -476,14 +476,14 @@ jobs:
           apt-get install -y --no-install-recommends git ca-certificates build-essential which \
             libssl-dev openssl libpcre2-dev zlib1g-dev libzstd-dev libbrotli-dev \
             python3-dev python3-pytest python3-openssl python3-packaging python3-zstandard python3-brotli \
-            php-dev libphp-embed php-cli procps iproute2 curl pkg-config
+            procps iproute2 curl pkg-config
       - uses: actions/checkout@v7
         with:
           repository: ndj888/unit
-          ref: 45012d7c460fe93ef34172dd8d0ce01f0ef8e6da
+          ref: 00ccf17a8634f5f6a8713d2db4e73fffae454e43
           fetch-depth: 0
           persist-credentials: false
-      - name: Assert exact source and PHP latest coverage
+      - name: Assert exact source and PHP 8.5 coverage
         run: |
           set -euo pipefail
           mkdir -p artifacts
@@ -493,13 +493,56 @@ jobs:
           {
             git log -1 --format=fuller
             gcc --version
-            php --version
-            php-config --version
             python3 --version
-            printf 'Coverage: Debian testing PHP (actual version recorded), full PHP application/targets and all 18 request-target regressions.\n'
+            printf 'Coverage: explicit PHP 8.5 CLI/dev/embed from one source, full PHP application/targets and all 18 request-target regressions.\n'
           } 2>&1 | tee artifacts/provenance.log
-          php -r 'if (PHP_VERSION_ID < 80500) { fwrite(STDERR, "PHP >= 8.5 is required for latest-PHP coverage\n"); exit(1); }'
-          test "$(php-config --version)" = "$(php -r 'echo PHP_VERSION;')"
+      - name: Install and prove a coherent PHP 8.5 CLI/dev/embed toolchain
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # Reuse the packaging path already maintained and tested by this source tree.
+          . ./pkg/deb/sury-setup.sh
+          setup_sury_if_needed '8.5'
+          apt_retry apt-get install -y --no-install-recommends \
+            php8.5-cli php8.5-dev libphp8.5-embed
+          {
+            php8.5 --version
+            php-config8.5 --version
+            apt-cache policy php8.5-cli php8.5-dev libphp8.5-embed
+            dpkg-query -W -f='${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\n' \
+              php8.5-cli php8.5-dev libphp8.5-embed
+          } 2>&1 | tee -a artifacts/provenance.log
+          php8.5 -r 'if (PHP_VERSION_ID < 80500) { fwrite(STDERR, "PHP >= 8.5 is required for latest-PHP coverage\n"); exit(1); } foreach (["filter_input", "session_start", "hash", "json_encode"] as $fn) { if (!function_exists($fn)) { fwrite(STDERR, "Missing required PHP function: $fn\n"); exit(1); } }'
+          test "$(php-config8.5 --version)" = "$(php8.5 -r 'echo PHP_VERSION;')"
+          python3 - <<'PYTHON'
+          import subprocess
+          packages = ('php8.5-cli', 'php8.5-dev', 'libphp8.5-embed')
+          records = []
+          for package in packages:
+              record = subprocess.check_output([
+                  'dpkg-query', '-W', '-f=${Version}\t${source:Package}\t${source:Version}', package,
+              ], text=True).strip().split('\t')
+              assert len(record) == 3 and record[1] == 'php8.5', (package, record)
+              records.append(tuple(record))
+          assert len(set(records)) == 1, f'PHP CLI/dev/embed packages must share binary and source versions: {records}'
+          print(f'Coherent PHP 8.5 binary/source package identity: {records[0]}')
+          PYTHON
+          # Enumerate only the selected embed package. Debian/Sury may use a
+          # versioned library name; give Unit its expected -lphp link explicitly.
+          mapfile -t php_libraries < <(
+            dpkg-query -L libphp8.5-embed \
+              | grep -E '/libphp(8\.5)?\.so(\.[0-9]+)*$' \
+              | while IFS= read -r library; do
+                  if [ -f "$library" ]; then readlink -f "$library"; fi
+                done \
+              | sort -u
+          )
+          test "${#php_libraries[@]}" -eq 1
+          test -s "${php_libraries[0]}"
+          printf '%s\n' "${php_libraries[0]}" | tee artifacts/php85-library-path
+          install -d /opt/php85-embed
+          ln -s "${php_libraries[0]}" /opt/php85-embed/libphp.so
       - name: Build strict core and real PHP/Python modules
         run: |
           set -euo pipefail
@@ -510,16 +553,15 @@ jobs:
           make -j4 build/lib/libunit.a tests 2>&1 | tee artifacts/build-tests.log
           ./configure python --config=python3-config 2>&1 | tee artifacts/configure-python.log
           make -j4 python3 2>&1 | tee artifacts/build-python.log
-          mapfile -t php_libraries < <(find /usr/lib -name libphp.so ( -type f -o -type l ))
-          test "${#php_libraries[@]}" -eq 1
-          test -f "${php_libraries[0]}"
-          php_lib_dir="$(readlink -f "$(dirname "${php_libraries[0]}")")"
-          ./configure php --module=php --config=php-config "--lib-path=$php_lib_dir" \
+          ./configure php --module=php --config=php-config8.5 --lib-path=/opt/php85-embed \
             2>&1 | tee artifacts/configure-php.log
           make -j4 php 2>&1 | tee artifacts/build-php.log
           test -s build/lib/unit/modules/php.unit.so
           test -s build/lib/unit/modules/python3.unit.so
           ldd build/lib/unit/modules/php.unit.so 2>&1 | tee artifacts/php-module-linkage.log
+          linked_php=$(awk '$1 ~ /^libphp(8\.5)?\.so/ && $2 == "=>" {print $3}' artifacts/php-module-linkage.log)
+          test -n "$linked_php"
+          test "$(readlink -f "$linked_php")" = "$(cat artifacts/php85-library-path)"
       - name: Run full PHP application/targets and all request-target socket cases
         timeout-minutes: 15
         run: |
