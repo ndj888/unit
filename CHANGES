@@ -1,10 +1,10 @@
 
 Changes with FreeUnit 1.38.0                                     09 Nov 2026
 
-    *) Feature: PHP exposes the decoded, normalized request path without
-       the query in $_SERVER['UNIT_REWRITTEN_PATH'], even without a rewrite.
-       After a route rewrite it is the rewritten path.  REQUEST_URI keeps
-       the original request target.  See
+    *) Feature: PHP exposes the decoded, normalized request path without the
+       query in $_SERVER['UNIT_REWRITTEN_PATH'], even without a rewrite.
+       After a route rewrite it is the rewritten path. REQUEST_URI keeps the
+       original request target. See
        https://github.com/nginx/unit/issues/1615.
 
     *) Bugfix: a request target containing an unencoded space was accepted
@@ -3856,4 +3856,3 @@ Changes with Unit 0.2                                            19 Oct 2017
 Changes with Unit 0.1                                            06 Sep 2017
 
     *) First public release.
-
