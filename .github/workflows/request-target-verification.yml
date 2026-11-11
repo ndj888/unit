@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 env:
-  SOURCE_SHA: 6099d6bc2a0e02ead72c859811fa4e42bb3aa0d8
+  SOURCE_SHA: 8a5e11d420efc3158b85cb6e21532bcf8531e8f3
   BASELINE_SHA: fb8cd508da26dcf071b039631b70305bd3862de2
 
 defaults:
@@ -32,13 +32,13 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends git ca-certificates build-essential which \
             libssl-dev openssl libpcre2-dev zlib1g-dev libzstd-dev libbrotli-dev \
-            python3-dev python3-pytest python3-openssl python3-packaging python3-venv \
+            python3-dev python3-pytest python3-openssl python3-packaging python3-venv python3-zstandard python3-brotli \
             procps iproute2 curl pkg-config
       - uses: actions/checkout@v7
         with:
           repository: ndj888/unit
-          ref: 6099d6bc2a0e02ead72c859811fa4e42bb3aa0d8
-          fetch-depth: 2
+          ref: 8a5e11d420efc3158b85cb6e21532bcf8531e8f3
+          fetch-depth: 3
           persist-credentials: false
       - name: Assert exact source and record coverage
         run: |
@@ -46,7 +46,7 @@ jobs:
           mkdir -p artifacts
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          test "$(git rev-parse HEAD^1)" = "$BASELINE_SHA"
+          git merge-base --is-ancestor "$BASELINE_SHA" HEAD
           {
             git log -1 --format=fuller
             git status --short
@@ -204,8 +204,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: ndj888/unit
-          ref: 6099d6bc2a0e02ead72c859811fa4e42bb3aa0d8
-          fetch-depth: 2
+          ref: 8a5e11d420efc3158b85cb6e21532bcf8531e8f3
+          fetch-depth: 3
           persist-credentials: false
       - name: Assert exact source and compile strict core
         run: |
@@ -213,7 +213,7 @@ jobs:
           mkdir -p artifacts
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          test "$(git rev-parse HEAD^1)" = "$BASELINE_SHA"
+          git merge-base --is-ancestor "$BASELINE_SHA" HEAD
           git log -1 --format=fuller | tee artifacts/provenance.log
           ${{ matrix.cc }} --version | tee artifacts/compiler.log
           ./configure --cc=${{ matrix.cc }} --hardening=strict --tests --openssl \
@@ -290,8 +290,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: ndj888/unit
-          ref: 6099d6bc2a0e02ead72c859811fa4e42bb3aa0d8
-          fetch-depth: 2
+          ref: 8a5e11d420efc3158b85cb6e21532bcf8531e8f3
+          fetch-depth: 3
           persist-credentials: false
       - name: Assert exact source and build sanitizer C suite
         run: |
@@ -299,7 +299,7 @@ jobs:
           mkdir -p artifacts
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          test "$(git rev-parse HEAD^1)" = "$BASELINE_SHA"
+          git merge-base --is-ancestor "$BASELINE_SHA" HEAD
           git log -1 --format=fuller | tee artifacts/provenance.log
           ${{ matrix.cc }} --version | tee artifacts/compiler.log
           ASAN_OPTIONS=detect_leaks=0 ./configure \
@@ -353,8 +353,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: ndj888/unit
-          ref: 6099d6bc2a0e02ead72c859811fa4e42bb3aa0d8
-          fetch-depth: 2
+          ref: 8a5e11d420efc3158b85cb6e21532bcf8531e8f3
+          fetch-depth: 3
           persist-credentials: false
       - name: Assert exact source and build public clang-ast plugin
         run: |
@@ -362,7 +362,7 @@ jobs:
           mkdir -p artifacts
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          test "$(git rev-parse HEAD^1)" = "$BASELINE_SHA"
+          git merge-base --is-ancestor "$BASELINE_SHA" HEAD
           {
             git log -1 --format=fuller
             clang --version
