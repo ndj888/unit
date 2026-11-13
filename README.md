@@ -2,7 +2,7 @@
 
 `ndj888/unit` tracks [FreeUnit](https://github.com/freeunitorg/freeunit), the maintained continuation of NGINX Unit.
 `master` mirrors upstream `master` exactly. `codex/develop` retains this fork's history, current upstream code, and the latest personal changes.
-The development branch includes PHP `UNIT_REWRITTEN_PATH` ([FreeUnit #829](https://github.com/freeunitorg/freeunit/pull/829)) and rejection of unencoded spaces in request targets ([FreeUnit #970](https://github.com/freeunitorg/freeunit/pull/970)). Their original PR branches remain separate.
+The development branch keeps PHP `UNIT_REWRITTEN_PATH` available for unchanged paths and through `filter_input(INPUT_SERVER, ...)`. FreeUnit merged the original feature in [#967](https://github.com/freeunitorg/freeunit/pull/967) with different registration rules. The HTTP request-target and CI fixes are now part of upstream ([#977](https://github.com/freeunitorg/freeunit/pull/977), [#971](https://github.com/freeunitorg/freeunit/pull/971)).
 See [FORK-MAINTENANCE.md](FORK-MAINTENANCE.md) for branch synchronization, validation, and historical release/deployment records.
 
 # FreeUnit — Community LTS fork of Unit

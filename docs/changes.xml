@@ -10,21 +10,62 @@
          date="2026-11-09" time="00:00:00 +0000"
          packager="FreeUnit Packaging &lt;team@freeunit.org&gt;">
 
-<change type="feature">
+<change type="change">
 <para>
-PHP exposes the decoded, normalized request path without the query in
-$_SERVER['UNIT_REWRITTEN_PATH'], even without a rewrite.
-After a route rewrite it is the rewritten path.
-REQUEST_URI keeps the original request target.
-See https://github.com/nginx/unit/issues/1615.
+a request target that contains an unencoded space, a control character such
+as HTAB, or DEL now gets a 400 response.  Before, the unencoded space, DEL and
+the control characters other than NUL, CR and LF were accepted as part of the
+target.  The control API uses the same parser and closes the connection on
+such a request.  Percent-encoded spaces and control characters in paths and
+arguments remain supported.
 </para>
 </change>
 
-<change type="bugfix">
+<change type="change">
 <para>
-a request target containing an unencoded space was accepted as part of the
-request line; such requests now get a 400 response.  Percent-encoded spaces
-in paths and arguments remain supported.
+with a PCRE2 library built with Unicode support, route regexes match in UTF-8
+mode: "." and a character class match one whole UTF-8 character, not one byte,
+and "\xHH" is a code point, so "\xff" matches U+00FF (the bytes C3 BF).  So a
+class of bytes such as "[\x80-\xff]" is a class of the code points U+0080 to
+U+00FF and no longer matches a Cyrillic path, and "\xc3\xa9" is U+00C3 U+00A9,
+not the UTF-8 bytes of U+00E9: write the character itself.  A
+pattern that counts bytes, such as ".{2}" for one 2-byte character, counts
+characters now.  Check route rules that deny access before the upgrade; a
+notice is logged at configuration load for a pattern with an escape from
+"\x80" to "\xff", also in the "\x{...}" form; octal escapes get no notice.
+Caseless matching also folds non-ASCII letters, such as Cyrillic.  With PCRE2
+10.43 or later, in the headers at build time and in the library at run time,
+it keeps ASCII and non-ASCII apart; with an older PCRE2 "(?i)k" also matches
+U+212A and "(?i)s" matches U+017F.  A request value that is not valid UTF-8,
+such as "/admin/%FF", matches a byte-mode twin of the pattern, as before, so
+an invalid byte cannot make a pattern miss.  A pattern that has no byte-mode
+twin fails such a request with a 500 response, also when a later route would
+match it: one that is valid only in UTF mode, such as "\x{43f}", or one that
+starts with "(*UTF)".  A pattern that UTF mode does not accept matches bytes,
+and a notice is logged.  PCRE 1 and PCRE2 without Unicode support still match
+bytes.
+</para>
+</change>
+
+<change type="feature">
+<para>
+PHP exposes the decoded, normalized request path, without the query, in
+$_SERVER['UNIT_REWRITTEN_PATH'], even if the path is unchanged. The value is
+also available through filter_input(INPUT_SERVER, 'UNIT_REWRITTEN_PATH').
+REQUEST_URI keeps the original request target. See
+https://github.com/nginx/unit/issues/1615.
+</para>
+</change>
+
+<change type="feature">
+<para>
+PHP runs a fixed "script" target from OPcache without opening the script file
+on each request, when "opcache.validate_timestamps" is off.  A warm request
+then makes a stat and an access call on the script file in place of the open,
+the fstat calls, the lseek and the close.  The request opens the script as
+before when "open_basedir", "opcache.revalidate_path" or
+"opcache.restrict_api" is set, when the script is not cached, and on PHP older
+than 8.1.
 </para>
 </change>
 

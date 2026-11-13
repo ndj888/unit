@@ -1,6 +1,7 @@
 <?php
 $server = $_SERVER;
 $result = array(
+    'pid' => getmypid(),
     'present' => array_key_exists('UNIT_REWRITTEN_PATH', $server),
     'path' => isset($server['UNIT_REWRITTEN_PATH'])
         ? $server['UNIT_REWRITTEN_PATH'] : null,
