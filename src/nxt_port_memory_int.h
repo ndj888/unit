@@ -317,4 +317,34 @@ nxt_port_mmap_set_chunk_free(nxt_free_map_t *m, nxt_chunk_id_t c)
 }
 
 
+/* Release an owned range [c, end) without changing any other bitmap bits. */
+
+nxt_inline void
+nxt_port_mmap_set_chunks_free(nxt_free_map_t *m, nxt_chunk_id_t c,
+    nxt_chunk_id_t end)
+{
+    size_t                bit, n;
+    nxt_free_map_t        mask;
+    const nxt_free_map_t  all = (nxt_free_map_t) -1;
+
+    nxt_assert(c <= end && end <= PORT_MMAP_CHUNK_COUNT);
+
+    if (end - c == 1) {
+        nxt_port_mmap_set_chunk_free(m, c);
+        return;
+    }
+
+    while (c < end) {
+        bit = c % FREE_BITS;
+        n = nxt_min((size_t) (end - c), FREE_BITS - bit);
+        mask = (all >> (FREE_BITS - n)) << bit;
+
+        /* The other process can change even the bits in this word. */
+        nxt_atomic_or_fetch(m + FREE_IDX(c), mask);
+
+        c += (nxt_chunk_id_t) n;
+    }
+}
+
+
 #endif /* _NXT_PORT_MEMORY_INT_H_INCLUDED_ */

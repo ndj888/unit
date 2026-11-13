@@ -171,7 +171,7 @@ nxt_port_mmap_buf_completion(nxt_task_t *task, void *obj, void *data)
     nxt_buf_t                *b, *next;
     nxt_pid_t                src_pid, dst_pid;
     nxt_process_t            *process;
-    nxt_chunk_id_t           c;
+    nxt_chunk_id_t           c, end;
     nxt_port_mmap_header_t   *hdr;
     nxt_port_mmap_handler_t  *mmap_handler;
 
@@ -230,11 +230,14 @@ complete_buf:
               "%PI->%PI,%d,%d", b, b->mem.start, b->mem.end - b->mem.start,
               b->is_port_mmap_sent, src_pid, dst_pid, hdr->id, c);
 
-    while (p < b->mem.end) {
-        nxt_port_mmap_set_chunk_free(hdr->free_map, c);
+    if (p < b->mem.end) {
+        if (b->mem.end - p <= PORT_MMAP_CHUNK_SIZE) {
+            nxt_port_mmap_set_chunk_free(hdr->free_map, c);
 
-        p += PORT_MMAP_CHUNK_SIZE;
-        c++;
+        } else {
+            end = nxt_port_mmap_chunk_id(hdr, b->mem.end - 1) + 1;
+            nxt_port_mmap_set_chunks_free(hdr->free_map, c, end);
+        }
     }
 
     if (dst_pid == nxt_pid

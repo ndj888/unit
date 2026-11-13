@@ -113,6 +113,69 @@ nxt_mmap_read_child(void *data)
 }
 
 
+static nxt_int_t
+nxt_mmap_free_range_test(nxt_thread_t *thr)
+{
+    nxt_uint_t              i, w;
+    nxt_bool_t              busy;
+    nxt_chunk_id_t          c;
+    nxt_port_mmap_header_t  hdr;
+
+    static const struct {
+        nxt_chunk_id_t  first;
+        nxt_chunk_id_t  end;
+    } cases[] = {
+        { 0, 0 },
+        { 0, 1 },
+        { 2, 5 },
+        { FREE_BITS - 1, FREE_BITS + 1 },
+        { 0, FREE_BITS },
+        { 1, PORT_MMAP_CHUNK_COUNT - 1 },
+        { PORT_MMAP_CHUNK_COUNT - 2, PORT_MMAP_CHUNK_COUNT },
+        { 0, PORT_MMAP_CHUNK_COUNT },
+        { PORT_MMAP_CHUNK_COUNT, PORT_MMAP_CHUNK_COUNT },
+    };
+
+    for (i = 0; i < nxt_nitems(cases); i++) {
+        if (cases[i].end > PORT_MMAP_CHUNK_COUNT) {
+            /* A tiny segment may have only one word. */
+            continue;
+        }
+
+        /* Keep already-free bits outside the released range as well. */
+        for (w = 0; w < MAX_FREE_IDX; w++) {
+            nxt_atomic_store(&hdr.free_map[w], 2);
+        }
+
+        nxt_atomic_store(&hdr.free_map_padding, 2);
+
+        nxt_port_mmap_set_chunks_free(hdr.free_map, cases[i].first,
+                                      cases[i].end);
+
+        for (c = 0; c < PORT_MMAP_CHUNK_COUNT; c++) {
+            busy = c % FREE_BITS != 1
+                   && (c < cases[i].first || c >= cases[i].end);
+
+            if (nxt_port_mmap_get_chunk_busy(hdr.free_map, c) != busy) {
+                nxt_log_alert(thr->log, "port mmap release [%uD,%uD): "
+                              "wrong state for chunk %uD",
+                              cases[i].first, cases[i].end, c);
+                return NXT_ERROR;
+            }
+        }
+
+        if (nxt_atomic_load(&hdr.free_map_padding) != 2) {
+            nxt_log_alert(thr->log, "port mmap release [%uD,%uD): "
+                          "changed the sentinel word",
+                          cases[i].first, cases[i].end);
+            return NXT_ERROR;
+        }
+    }
+
+    return NXT_OK;
+}
+
+
 nxt_int_t
 nxt_port_mmap_read_test(nxt_thread_t *thr)
 {
@@ -130,6 +193,10 @@ nxt_port_mmap_read_test(nxt_thread_t *thr)
     nxt_port_mmap_handler_t  *mmap_handler;
 
     nxt_thread_time_update(thr);
+
+    if (nxt_mmap_free_range_test(thr) != NXT_OK) {
+        return NXT_ERROR;
+    }
 
     task = thr->task;
     task->thread = thr;

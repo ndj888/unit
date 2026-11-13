@@ -12,6 +12,14 @@
 
 <change type="change">
 <para>
+the router returns contiguous shared-memory response chunks in batches
+within each bitmap word, reducing atomic operations for large responses
+from PHP and other application modules.
+</para>
+</change>
+
+<change type="change">
+<para>
 a request target that contains an unencoded space, a control character such
 as HTAB, or DEL now gets a 400 response.  Before, the unencoded space, DEL and
 the control characters other than NUL, CR and LF were accepted as part of the
