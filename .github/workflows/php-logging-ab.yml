@@ -1,0 +1,76 @@
+name: Paired PHP logging performance
+on:
+  push:
+    branches: [codex/verify-php-log-perf-20261113]
+    paths: [.github/workflows/php-logging-ab.yml]
+permissions:
+  contents: read
+env:
+  BASELINE: 2c1aaa01d7a631c733cc939d827cbf07d1a04b93
+  CANDIDATE: 6aea3c20b4d26bb4791cbd341047cdb3a677395d
+  DRIVER: 3892d6dbf22348b484ead4cdf1249ea88e48f614
+jobs:
+  compare:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 35
+    container:
+      image: debian:trixie
+      options: --privileged
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install compiler and runtime prerequisites
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get -o Acquire::Retries=3 update
+          apt-get install -y --no-install-recommends git ca-certificates curl build-essential libssl-dev libpcre2-dev zlib1g-dev libzstd-dev libbrotli-dev python3 procps which pkg-config
+      - uses: actions/checkout@v7
+        with:
+          ref: 3892d6dbf22348b484ead4cdf1249ea88e48f614
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build both sides using the same PHP 8.5 embed toolchain
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          mkdir -p artifacts
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$DRIVER"
+          git merge-base --is-ancestor "$BASELINE" "$CANDIDATE"
+          . ./pkg/deb/sury-setup.sh
+          setup_sury_if_needed '8.5'
+          apt_retry apt-get install -y --no-install-recommends php8.5-cli php8.5-dev libphp8.5-embed
+          dpkg-query -W php8.5-cli php8.5-dev libphp8.5-embed | tee artifacts/php-packages.txt
+          php8.5 -v | tee artifacts/php-version.txt
+          test "$(php-config8.5 --version)" = "$(php8.5 -r 'echo PHP_VERSION;')"
+          php8.5 -r 'if (!function_exists("opcache_is_script_cached") || !function_exists("filter_input")) exit(1);'
+          mkdir -p /opt/php85-embed
+          test -s /usr/lib/libphp8.5.so
+          ln -s /usr/lib/libphp8.5.so /opt/php85-embed/libphp.so
+          git worktree add --detach /tmp/unit-a "$BASELINE"
+          git worktree add --detach /tmp/unit-b "$CANDIDATE"
+          for entry in unit-a unit-b; do
+            (
+              cd "/tmp/$entry"
+              git -c safe.directory="/tmp/$entry" rev-parse HEAD
+              ./configure --openssl --zlib --zstd --brotli --hardening=strict
+              ./configure php --module=php --config=php-config8.5 --lib-path=/opt/php85-embed
+              make -j4
+              make -j4 php
+              test -s build/lib/unit/modules/php.unit.so
+            ) > "artifacts/$entry-build.log" 2>&1 || { tail -100 "artifacts/$entry-build.log"; exit 1; }
+          done
+      - name: Measure PHP log-heavy and quiet requests
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/php-logging-ab.py --baseline-build /tmp/unit-a/build --candidate-build /tmp/unit-b/build --baseline-sha "$BASELINE" --candidate-sha "$CANDIDATE" --pairs 10 --requests 5000 --warmup 500 --output artifacts/php-logging-ab.json | tee artifacts/php-logging-ab.log
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: php-logging-ab
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
