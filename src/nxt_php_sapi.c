@@ -44,11 +44,16 @@
 
 
 typedef struct {
-    nxt_str_t  root;
-    nxt_str_t  index;
-    nxt_str_t  script_name;
-    nxt_str_t  script_dirname;
-    nxt_str_t  script_filename;
+    nxt_str_t    root;
+    nxt_str_t    index;
+    nxt_str_t    script_name;
+    nxt_str_t    script_dirname;
+    nxt_str_t    script_filename;
+#if NXT_PHP8
+    zend_string  *document_root_value;
+    zend_string  *script_name_value;
+    zend_string  *script_filename_value;
+#endif
 } nxt_php_target_t;
 
 
@@ -61,6 +66,9 @@ typedef struct {
     nxt_str_t                script_filename;
     nxt_str_t                script_dirname;
     nxt_unit_request_info_t  *req;
+#if NXT_PHP8
+    const nxt_php_target_t   *target;
+#endif
     uint8_t                  static_script;  /* 1 bit */
 } nxt_php_run_ctx_t;
 
@@ -127,6 +135,11 @@ static void nxt_php_set_cstr(nxt_unit_request_info_t *req, nxt_uint_t var,
     const char *str, uint32_t len, zval *track_vars_array TSRMLS_DC);
 nxt_inline void nxt_php_register(nxt_uint_t var, const char *str, size_t len,
     zval *track_vars_array TSRMLS_DC);
+#if NXT_PHP8
+static zend_string *nxt_php_target_string(const nxt_str_t *str);
+nxt_inline void nxt_php_set_target_str(nxt_unit_request_info_t *req,
+    nxt_uint_t var, zend_string *cached, nxt_str_t *str, zval *track_vars_array);
+#endif
 void nxt_php_register_variables(zval *track_vars_array TSRMLS_DC);
 #if NXT_PHP8
 static void nxt_php_log_message(const char *message, int syslog_type_int);
@@ -708,6 +721,16 @@ nxt_php_set_target(nxt_task_t *task, nxt_php_target_t *target,
         }
     }
 
+#if NXT_PHP8
+    target->document_root_value = nxt_php_target_string(&target->root);
+
+    if (target->script_filename.length != 0) {
+        target->script_name_value = nxt_php_target_string(&target->script_name);
+        target->script_filename_value =
+            nxt_php_target_string(&target->script_filename);
+    }
+#endif
+
     return NXT_OK;
 
 fail:
@@ -717,6 +740,27 @@ fail:
 
     return NXT_ERROR;
 }
+
+
+#if NXT_PHP8
+
+static zend_string *
+nxt_php_target_string(const nxt_str_t *str)
+{
+    zend_string  *value;
+
+    /*
+     * The target owns a reference until the worker has shut down its last
+     * request.  Any string write through $_SERVER then copies the value
+     * before modifying it.  These strings belong to this worker only.
+     */
+    value = zend_string_init((const char *) str->start, str->length, 1);
+    GC_MAKE_PERSISTENT_LOCAL(value);
+
+    return value;
+}
+
+#endif
 
 
 static void
@@ -730,6 +774,20 @@ nxt_php_cleanup_targets(void)
 
     for (i = 0; i < nxt_php_targets_count; i++) {
         nxt_php_target_t *target = &nxt_php_targets[i];
+
+#if NXT_PHP8
+        if (target->document_root_value != NULL) {
+            zend_string_release(target->document_root_value);
+        }
+
+        if (target->script_name_value != NULL) {
+            zend_string_release(target->script_name_value);
+        }
+
+        if (target->script_filename_value != NULL) {
+            zend_string_release(target->script_filename_value);
+        }
+#endif
 
         /* Free root (allocated by nxt_realpath) */
         if (target->root.start != NULL) {
@@ -1157,6 +1215,9 @@ nxt_php_request_handler(nxt_unit_request_info_t *req)
     ctx.req = req;
     ctx.root = &target->root;
     ctx.index = &target->index;
+#if NXT_PHP8
+    ctx.target = target;
+#endif
 
     if (target->script_filename.length == 0) {
         nxt_php_dynamic_request(&ctx, r);
@@ -1564,7 +1625,7 @@ nxt_php_ini_value(const char *name, size_t len)
  * failed open with its status.
  */
 static nxt_int_t
-nxt_php_opcache_serves(nxt_php_run_ctx_t *ctx, const char *filename)
+nxt_php_opcache_serves(nxt_php_run_ctx_t *ctx, zend_string *filename)
 {
     zval           param, retval;
     nxt_int_t      cached;
@@ -1609,7 +1670,7 @@ nxt_php_opcache_serves(nxt_php_run_ctx_t *ctx, const char *filename)
     }
 
     ZVAL_UNDEF(&retval);
-    ZVAL_STRINGL(&param, filename, ctx->script_filename.length);
+    ZVAL_STR_COPY(&param, filename);
 
     zend_call_known_function(fn, NULL, NULL, &retval, 1, &param, NULL);
 
@@ -1623,11 +1684,11 @@ nxt_php_opcache_serves(nxt_php_run_ctx_t *ctx, const char *filename)
         return 0;
     }
 
-    if (stat(filename, &sb) != 0 || !S_ISREG(sb.st_mode)) {
+    if (stat(ZSTR_VAL(filename), &sb) != 0 || !S_ISREG(sb.st_mode)) {
         return 0;
     }
 
-    if (access(filename, R_OK) != 0) {
+    if (access(ZSTR_VAL(filename), R_OK) != 0) {
         return 0;
     }
 
@@ -1840,7 +1901,7 @@ nxt_php_execute(nxt_php_run_ctx_t *ctx, nxt_unit_request_t *r)
      */
     zend_stream_init_filename(&file_handle, filename);
 
-    if (nxt_php_opcache_serves(ctx, filename)) {
+    if (nxt_php_opcache_serves(ctx, file_handle.filename)) {
         nxt_unit_req_debug(ctx->req, "PHP script \"%s\" runs from OPcache "
                            "without an open", filename);
 
@@ -2231,8 +2292,14 @@ nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
                         track_vars_array TSRMLS_CC);
 
     } else {
+#if NXT_PHP8
+        nxt_php_set_target_str(req, NXT_PHP_PHP_SELF,
+                               ctx->target->script_name_value,
+                               &ctx->script_name, track_vars_array);
+#else
         nxt_php_set_str(req, NXT_PHP_PHP_SELF, &ctx->script_name,
                         track_vars_array TSRMLS_CC);
+#endif
     }
 
     /*
@@ -2242,16 +2309,28 @@ nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
      * filename of the current (i.e. included) file.
      */
 
+#if NXT_PHP8
+    nxt_php_set_target_str(req, NXT_PHP_SCRIPT_NAME,
+                           ctx->target->script_name_value,
+                           &ctx->script_name, track_vars_array);
+#else
     nxt_php_set_str(req, NXT_PHP_SCRIPT_NAME, &ctx->script_name,
                     track_vars_array TSRMLS_CC);
+#endif
 
     /*
      * 'SCRIPT_FILENAME'
      * The absolute pathname of the currently executing script.
      */
 
+#if NXT_PHP8
+    nxt_php_set_target_str(req, NXT_PHP_SCRIPT_FILENAME,
+                           ctx->target->script_filename_value,
+                           &ctx->script_filename, track_vars_array);
+#else
     nxt_php_set_str(req, NXT_PHP_SCRIPT_FILENAME, &ctx->script_filename,
                     track_vars_array TSRMLS_CC);
+#endif
 
     /*
      * 'DOCUMENT_ROOT'
@@ -2259,8 +2338,14 @@ nxt_php_register_variables(zval *track_vars_array TSRMLS_DC)
      * as defined in the server's configuration file.
      */
 
+#if NXT_PHP8
+    nxt_php_set_target_str(req, NXT_PHP_DOCUMENT_ROOT,
+                           ctx->target->document_root_value, ctx->root,
+                           track_vars_array);
+#else
     nxt_php_set_str(req, NXT_PHP_DOCUMENT_ROOT, ctx->root,
                     track_vars_array TSRMLS_CC);
+#endif
 
     /*
      * 'UNIT_REWRITTEN_PATH'
@@ -2391,6 +2476,31 @@ nxt_php_set_str(nxt_unit_request_info_t *req, nxt_uint_t var,
     nxt_php_set_cstr(req, var, (char *) s->start, s->length,
                      track_vars_array TSRMLS_CC);
 }
+
+
+#if NXT_PHP8
+
+nxt_inline void
+nxt_php_set_target_str(nxt_unit_request_info_t *req, nxt_uint_t var,
+    zend_string *cached, nxt_str_t *str, zval *track_vars_array)
+{
+    zval  value;
+
+    if (cached == NULL) {
+        nxt_php_set_str(req, var, str, track_vars_array);
+        return;
+    }
+
+    nxt_unit_req_debug(req, "php: register %s='%.*s'",
+                       (char *) nxt_php_server_names[var].start,
+                       (int) ZSTR_LEN(cached), ZSTR_VAL(cached));
+
+    ZVAL_STR_COPY(&value, cached);
+    zend_hash_update(Z_ARRVAL_P(track_vars_array), nxt_php_server_keys[var],
+                     &value);
+}
+
+#endif
 
 
 /*

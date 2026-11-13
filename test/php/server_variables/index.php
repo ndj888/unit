@@ -19,8 +19,14 @@ foreach ($names as $name) {
 /* The next request must not see any of these changes. */
 $_SERVER['REQUEST_METHOD'] = 'CHANGED';
 $_SERVER['SERVER_SOFTWARE'] .= '-changed';
-$_SERVER['SCRIPT_NAME'] .= '-changed';
-$_SERVER['DOCUMENT_ROOT'] .= '-changed';
+$scriptName = &$_SERVER['SCRIPT_NAME'];
+$scriptName[0] = '!';
+if ($_SERVER['PHP_SELF'] !== $vars['PHP_SELF']) {
+    throw new RuntimeException('SCRIPT_NAME write changed PHP_SELF');
+}
+$_SERVER['PHP_SELF'] .= '-changed';
+$_SERVER['SCRIPT_FILENAME'][0] = '!';
+$_SERVER['DOCUMENT_ROOT'][0] = '!';
 $ref = &$_SERVER['SERVER_PROTOCOL'];
 $ref .= '-changed';
 unset($_SERVER['QUERY_STRING']);

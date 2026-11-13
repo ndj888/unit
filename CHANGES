@@ -1,6 +1,11 @@
 
 Changes with FreeUnit 1.38.0                                     09 Nov 2026
 
+    *) Change: reuse fixed PHP server-variable strings per target on PHP 8,
+       and reuse the current request's script filename for the OPcache
+       lookup. Request-specific variables and input filtering retain their
+       existing behavior.
+
     *) Change: a request target that contains an unencoded space, a control
        character such as HTAB, or DEL now gets a 400 response. Before, the
        unencoded space, DEL and the control characters other than NUL, CR
