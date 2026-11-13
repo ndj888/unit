@@ -1,6 +1,10 @@
 
 Changes with FreeUnit 1.38.0                                     09 Nov 2026
 
+    *) Change: reduce the cost of formatting libunit log timestamps,
+       including PHP application messages, while keeping the existing
+       timestamp and log format.
+
     *) Change: a request target that contains an unencoded space, a control
        character such as HTAB, or DEL now gets a 400 response. Before, the
        unencoded space, DEL and the control characters other than NUL, CR

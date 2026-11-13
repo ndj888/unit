@@ -12,6 +12,13 @@
 
 <change type="change">
 <para>
+reduce the cost of formatting libunit log timestamps, including PHP
+application messages, while keeping the existing timestamp and log format.
+</para>
+</change>
+
+<change type="change">
+<para>
 a request target that contains an unencoded space, a control character such
 as HTAB, or DEL now gets a 400 response.  Before, the unencoded space, DEL and
 the control characters other than NUL, CR and LF were accepted as part of the

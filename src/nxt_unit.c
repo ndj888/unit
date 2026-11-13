@@ -10171,6 +10171,78 @@ static const char * nxt_unit_log_levels[] = {
 };
 
 
+nxt_inline void
+nxt_unit_log_two_digits(char *p, unsigned int n)
+{
+    p[0] = '0' + n / 10;
+    p[1] = '0' + n % 10;
+}
+
+
+/*
+ * Both loggers reserve space for a newline and call this with their whole
+ * log buffer available.  Format the common four-digit year directly,
+ * retaining snprintf for other dates and unusual calendar values.
+ */
+static char *
+nxt_unit_log_date(char *p, char *end, const struct tm *tm, int ms)
+{
+    unsigned int  year;
+
+    if (nxt_fast_path(tm->tm_year >= -900 && tm->tm_year <= 8099
+                      && (unsigned int) tm->tm_mon < 12
+                      && tm->tm_mday >= 1 && tm->tm_mday <= 31
+                      && (unsigned int) tm->tm_hour < 24
+                      && (unsigned int) tm->tm_min < 60
+                      && (unsigned int) tm->tm_sec <= 60
+#if (NXT_DEBUG)
+                      && (unsigned int) ms < 1000 && end - p > 24
+#else
+                      && end - p > 20
+#endif
+                     ))
+    {
+        year = tm->tm_year + 1900;
+        nxt_unit_log_two_digits(p, year / 100);
+        nxt_unit_log_two_digits(p + 2, year % 100);
+        p[4] = '/';
+        nxt_unit_log_two_digits(p + 5, tm->tm_mon + 1);
+        p[7] = '/';
+        nxt_unit_log_two_digits(p + 8, tm->tm_mday);
+        p[10] = ' ';
+        nxt_unit_log_two_digits(p + 11, tm->tm_hour);
+        p[13] = ':';
+        nxt_unit_log_two_digits(p + 14, tm->tm_min);
+        p[16] = ':';
+        nxt_unit_log_two_digits(p + 17, tm->tm_sec);
+
+#if (NXT_DEBUG)
+        p[19] = '.';
+        p[20] = '0' + ms / 100;
+        nxt_unit_log_two_digits(p + 21, ms % 100);
+        p += 23;
+#else
+        p += 19;
+#endif
+        *p++ = ' ';
+        *p = '\0';
+
+        return p;
+    }
+
+#if (NXT_DEBUG)
+    return p + snprintf(p, end - p, "%4d/%02d/%02d %02d:%02d:%02d.%03d ",
+                        tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+                        tm->tm_hour, tm->tm_min, tm->tm_sec, ms);
+#else
+    (void) ms;
+    return p + snprintf(p, end - p, "%4d/%02d/%02d %02d:%02d:%02d ",
+                        tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+                        tm->tm_hour, tm->tm_min, tm->tm_sec);
+#endif
+}
+
+
 static char *
 nxt_unit_snprint_prefix(char *p, char *end, pid_t pid, int level)
 {
@@ -10185,18 +10257,7 @@ nxt_unit_snprint_prefix(char *p, char *end, pid_t pid, int level)
     tm = *localtime(&ts.tv_sec);
 #endif
 
-#if (NXT_DEBUG)
-    p += snprintf(p, end - p,
-                  "%4d/%02d/%02d %02d:%02d:%02d.%03d ",
-                  tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                  tm.tm_hour, tm.tm_min, tm.tm_sec,
-                  (int) ts.tv_nsec / 1000000);
-#else
-    p += snprintf(p, end - p,
-                  "%4d/%02d/%02d %02d:%02d:%02d ",
-                  tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                  tm.tm_hour, tm.tm_min, tm.tm_sec);
-#endif
+    p = nxt_unit_log_date(p, end, &tm, (int) (ts.tv_nsec / 1000000));
 
     p += snprintf(p, end - p,
                   "[%s] %d#%"PRIu64" [unit] ", nxt_unit_log_levels[level],
