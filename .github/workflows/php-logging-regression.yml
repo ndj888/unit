@@ -1,0 +1,618 @@
+name: Verify libunit timestamp formatting
+
+on:
+  push:
+    branches: [codex/verify-php-log-perf-20261113]
+    paths: [.github/workflows/php-logging-regression.yml]
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_SHA: 6aea3c20b4d26bb4791cbd341047cdb3a677395d
+  UPSTREAM_SHA: 7765a6ae3260ab8dba7dafac90783328bbbacbe3
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  functional:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    container:
+      image: debian:trixie
+      options: --privileged
+    steps:
+      - name: Install tools inside Docker
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          printf 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-ci-bounds
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates build-essential which \
+            libssl-dev openssl libpcre2-dev zlib1g-dev libzstd-dev libbrotli-dev \
+            python3-dev python3-pytest python3-openssl python3-packaging python3-venv python3-zstandard python3-brotli \
+            procps iproute2 curl pkg-config php-dev libphp-embed php-cli php8.4-opcache
+          phpenmod -v 8.4 -s embed opcache
+      - uses: actions/checkout@v7
+        with:
+          repository: ndj888/unit
+          ref: 6aea3c20b4d26bb4791cbd341047cdb3a677395d
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert exact source and record coverage
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD
+          {
+            git log -1 --format=fuller
+            git status --short
+            printf '\nVerified upstream ancestor: %s\n' "$UPSTREAM_SHA"
+            printf 'Coverage: C core, OpenSSL, zlib/zstd/brotli, PHP, Python, ASGI, routing/static and raw sockets.\n'
+            printf 'No njs or otel; optional generic tests may skip, while PHP rewritten-path, targets and all 26 socket cases must execute.\n'
+            gcc --version
+            python3 --version
+            php --version
+            php-config --version
+            php --ini
+            php -m
+            pytest-3 --version
+          } 2>&1 | tee artifacts/provenance.log
+          php -r 'if (PHP_VERSION_ID < 80400 || PHP_VERSION_ID >= 80500 || !function_exists("filter_input") || !function_exists("opcache_is_script_cached")) { exit(1); }'
+          test "$(php-config --version)" = "$(php -r 'echo PHP_VERSION;')"
+      - name: Build PCRE2 core, C tests and PHP/Python modules
+        run: |
+          set -euo pipefail
+          ./configure --openssl --zlib --zstd --brotli --tests 2>&1 | tee artifacts/configure.log
+          grep -Eq '^#define[[:space:]]+NXT_HAVE_PCRE2[[:space:]]+1([[:space:]]|$)' build/include/nxt_auto_config.h
+          make -j4 2>&1 | tee artifacts/build.log
+          make -j4 build/lib/libunit.a tests 2>&1 | tee artifacts/build-tests.log
+          ./configure python --config=python3-config 2>&1 | tee artifacts/configure-python.log
+          make -j4 python3 2>&1 | tee artifacts/build-python.log
+          mapfile -t php_libraries < <(find /usr/lib -name libphp.so \( -type f -o -type l \))
+          test "${#php_libraries[@]}" -eq 1
+          test -f "${php_libraries[0]}"
+          php_lib_dir="$(readlink -f "$(dirname "${php_libraries[0]}")")"
+          ./configure php --module=php --config=php-config "--lib-path=$php_lib_dir" \
+            2>&1 | tee artifacts/configure-php.log
+          make -j4 php 2>&1 | tee artifacts/build-php.log
+          test -s build/lib/unit/modules/php.unit.so
+          test -s build/lib/unit/modules/python3.unit.so
+      - name: Run full C suite, Unicode regex checks and libunit tests
+        run: |
+          set -euo pipefail
+          .github/scripts/check-test-hooks.sh 2>&1 | tee artifacts/test-hooks.log
+          ./build/tests 2>&1 | tee artifacts/c-tests.log
+          grep -F 'regex test passed' artifacts/c-tests.log
+          grep -F 'regex warn test passed: one warning per kind' artifacts/c-tests.log
+          grep -F 'regex ASCII test passed: fast path, page end' artifacts/c-tests.log
+          ./build/unit_close_test 2>&1 | tee artifacts/unit-close.log
+          ./build/unit_port_recv_test 2>&1 | tee artifacts/unit-port-recv.log
+          ./build/unit_msg_test 2>&1 | tee artifacts/unit-msg.log
+      - name: Run PHP and affected Python/HTTP routing/static regressions
+        timeout-minutes: 20
+        env:
+          TZ: Asia/Kolkata
+        run: |
+          set -euo pipefail
+          pytest-3 --print-log -ra --port 18080 \
+            --junitxml=artifacts/functional.xml \
+            test/test_http_request_target.py \
+            test/test_access_log.py test/test_asgi_application.py \
+            test/test_python_application.py test/test_routing.py test/test_static.py \
+            test/test_php_application.py test/test_php_targets.py test/test_php_script_open.py \
+            test/test_php_server_variables.py \
+            test/test_http_client_framing.py test/test_http_expect.py \
+            test/test_http_header.py test/test_http_no_body_status.py \
+            test/test_route_if.py test/test_routing_tls.py \
+            test/test_static_share.py test/test_static_fallback.py \
+            test/test_static_types.py test/test_static_variables.py \
+            test/test_static_compression.py \
+            2>&1 | tee artifacts/functional.log
+          python3 - <<'PYTHON'
+          from collections import Counter
+          import xml.etree.ElementTree as ET
+
+          cases = ET.parse('artifacts/functional.xml').getroot().findall('.//testcase')
+          def file_cases(stem):
+              return [c for c in cases if c.attrib.get('classname', '').split('.')[-1] == stem]
+          def name(case):
+              return case.attrib['name'].split('[', 1)[0]
+          def ok(case):
+              return all(case.find(k) is None for k in ('failure', 'error', 'skipped'))
+          def require_pass(group, label):
+              assert group, f'{label}: no cases collected'
+              for case in group:
+                  assert ok(case), f'{label}: {ET.tostring(case, encoding="unicode")}'
+
+          sockets = file_cases('test_http_request_target')
+          expected = {
+              'test_http_request_target_raw_space': 16,
+              'test_http_request_target_control_character': 7,
+              'test_http_request_target_encoded_space_keepalive': 2,
+              'test_http_request_target_encoded_control_and_utf8': 1,
+          }
+          assert Counter(map(name, sockets)) == expected, Counter(map(name, sockets))
+          require_pass(sockets, 'all 26 request-target cases')
+          php = file_cases('test_php_application')
+          rewritten = [c for c in php if name(c).startswith('test_php_application_rewritten_path_')]
+          assert len(rewritten) >= 33, f'expected at least 33 rewritten-path cases, got {len(rewritten)}'
+          require_pass(rewritten, 'fork rewritten-path coverage')
+          for suffix in ('verbatim', 'normalized', 'filter_input', 'rewrite', 'worker_reuse'):
+              required = 'test_php_application_rewritten_path_' + suffix
+              require_pass([c for c in rewritten if name(c) == required], required)
+          targets = file_cases('test_php_targets')
+          require_pass(targets, 'PHP targets')
+          server_variables = file_cases('test_php_server_variables')
+          assert len(server_variables) == 3, f'expected 3 PHP server-variable cases, got {len(server_variables)}'
+          require_pass(server_variables, 'PHP server variables')
+          script_open = file_cases('test_php_script_open')
+          # The fixtures assert X-OPcache=1 in the actual Unit worker, not the CLI.
+          # Do not force unrelated platform/debug/optional cases to run.
+          opcache = ('test_php_script_open_static_script_opcache',
+                     'test_php_script_open_static_script_opcache_miss')
+          for required in opcache:
+              require_pass([c for c in script_open if name(c) == required], required)
+          for stem in ('test_access_log', 'test_asgi_application', 'test_python_application',
+                       'test_routing', 'test_static'):
+              assert any(map(ok, file_cases(stem))), f'no passing cases in {stem}'
+          utf = 'test_routes_match_regex_utf8'
+          require_pass([c for c in file_cases('test_routing') if name(c) == utf], utf)
+          print('Full routing suite and explicit PCRE2 Unicode case executed.')
+          print(f'PHP: {len(rewritten)} rewritten-path, {len(targets)} targets; required OPcache hit/miss cases passed.')
+          print(f'HTTP: all {len(sockets)} socket cases passed, including raw controls and encoded/UTF-8 cases.')
+          print(f'Suite: {sum(map(ok, cases))} passed; {sum(c.find("skipped") is not None for c in cases)} skipped.')
+          PYTHON
+      - name: Test lock-audit gate offline and verify the reviewed source pin
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          python3 -m pytest -ra --junitxml=artifacts/lock-audit-unit.xml \
+            pkg/contrib/test_check_lock_audit.py 2>&1 | tee artifacts/lock-audit-unit.log
+          python3 - <<'PYTHON'
+          import importlib.util
+          import json
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          cases = ET.parse('artifacts/lock-audit-unit.xml').getroot().findall('.//testcase')
+          assert cases, 'no lock-audit tests collected'
+          for c in cases:
+              assert not any(c.find(k) is not None for k in ('failure', 'error', 'skipped')), ET.tostring(c, encoding='unicode')
+          script = Path('pkg/contrib/check-lock-audit.py')
+          spec = importlib.util.spec_from_file_location('lock_audit_gate', script)
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          # This reads and validates local JSON/version/SHA512 metadata only.
+          # It does not run cargo, fetch an archive, query advisories or resolve reachability.
+          module.read_allowlist(module.ALLOWLIST)
+          data = json.loads(module.ALLOWLIST.read_text())
+          pin = data['reviewed_pin']
+          assert pin['version'] == '48.0.8', pin
+          assert len(data['allow']) == 14, f'expected 14 reviewed entries, got {len(data["allow"])}'
+          evidence = {'reviewed_pin': pin, 'allow_entries': len(data['allow']), 'unit_tests': len(cases)}
+          Path('artifacts/lock-audit-pin.json').write_text(json.dumps(evidence, indent=2) + '\n')
+          print(json.dumps(evidence, sort_keys=True))
+          print('Offline gate regression tests and static reviewed-pin consistency passed; this is not a current vulnerability audit.')
+          PYTHON
+      - name: Run stored routing configuration with restart
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          pytest-3 --print-log -ra --restart --port 18080 \
+            --junitxml=artifacts/routing-restart.xml \
+            test/test_routing.py::test_routes_match_host_idn_stored \
+            2>&1 | tee artifacts/routing-restart.log
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          cases = ET.parse('artifacts/routing-restart.xml').getroot().findall('.//testcase')
+          assert len(cases) == 1
+          assert not any(cases[0].find(k) is not None for k in ('failure', 'error', 'skipped'))
+          PY
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: php-logging-functional
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 7
+
+  strict:
+    name: Strict C (${{ matrix.cc }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    container:
+      image: debian:trixie
+      options: --privileged
+    steps:
+      - name: Install tools inside Docker
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          printf 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-ci-bounds
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates build-essential which \
+            clang libssl-dev libpcre2-dev libxml2-utils xsltproc
+      - uses: actions/checkout@v7
+        with:
+          repository: ndj888/unit
+          ref: 6aea3c20b4d26bb4791cbd341047cdb3a677395d
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert exact source and compile strict core
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD
+          git log -1 --format=fuller | tee artifacts/provenance.log
+          ${{ matrix.cc }} --version | tee artifacts/compiler.log
+          ./configure --cc=${{ matrix.cc }} --hardening=strict --tests --openssl \
+            2>&1 | tee artifacts/configure.log
+          grep -q 'hardening: .* strict$' artifacts/configure.log
+          for flag in -fstack-protector-strong -fstack-clash-protection \
+                      -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack \
+                      -Wformat=2 -Wvla -Wimplicit-fallthrough \
+                      -ftrivial-auto-var-init=pattern
+          do
+            grep -q "checking for $flag \.\.\. found" artifacts/configure.log \
+              || { echo "$flag was not found"; exit 1; }
+          done
+          grep -q 'checking for -D_FORTIFY_SOURCE=[23] \.\.\. found' artifacts/configure.log
+          grep -q 'define NXT_HAVE_BUILTIN_OVERFLOW' build/include/nxt_auto_config.h
+          make -j4 2>&1 | tee artifacts/build.log
+          make -j4 build/lib/libunit.a tests 2>&1 | tee artifacts/build-tests.log
+      - name: Run full C suite and hook isolation
+        run: |
+          set -euo pipefail
+          .github/scripts/check-test-hooks.sh 2>&1 | tee artifacts/test-hooks.log
+          ./build/tests 2>&1 | tee artifacts/c-tests.log
+          ./build/unit_close_test 2>&1 | tee artifacts/unit-close.log
+          ./build/unit_port_recv_test 2>&1 | tee artifacts/unit-port-recv.log
+          ./build/unit_msg_test 2>&1 | tee artifacts/unit-msg.log
+      - name: Check generated changelog
+        if: matrix.cc == 'gcc'
+        run: |
+          set -euo pipefail
+          if make -C docs check 2>&1 | tee artifacts/docs-check.log; then
+            git diff --exit-code -- CHANGES docs/changes.xml
+          else
+            docs_rc=$?
+            if [ -f build/CHANGES ]; then
+              cp build/CHANGES artifacts/generated-CHANGES
+              if diff -u CHANGES build/CHANGES | tee artifacts/docs-CHANGES.diff; then
+                :
+              else
+                diff_rc=$?
+                test "$diff_rc" -eq 1
+              fi
+            fi
+            exit "$docs_rc"
+          fi
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: php-logging-strict-${{ matrix.cc }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 7
+
+  sanitizer:
+    name: ASan UBSan C (${{ matrix.cc }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    container:
+      image: debian:trixie
+      options: --privileged
+    steps:
+      - name: Install tools inside Docker
+        timeout-minutes: 6
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          printf 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-ci-bounds
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates build-essential which \
+            clang libclang-rt-dev libssl-dev libpcre2-dev
+      - uses: actions/checkout@v7
+        with:
+          repository: ndj888/unit
+          ref: 6aea3c20b4d26bb4791cbd341047cdb3a677395d
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert exact source and build sanitizer C suite
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD
+          git log -1 --format=fuller | tee artifacts/provenance.log
+          ${{ matrix.cc }} --version | tee artifacts/compiler.log
+          ASAN_OPTIONS=detect_leaks=0 ./configure \
+            --cc=${{ matrix.cc }} --debug --tests --openssl \
+            --cc-opt='-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -O1 -g' \
+            --ld-opt='-fsanitize=address,undefined' 2>&1 | tee artifacts/configure.log
+          make -j4 2>&1 | tee artifacts/build.log
+          make -j4 build/lib/libunit.a tests 2>&1 | tee artifacts/build-tests.log
+          .github/scripts/check-test-hooks.sh 2>&1 | tee artifacts/test-hooks.log
+      - name: Run full C suite with leak and undefined behavior detection
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1
+        run: |
+          set -euo pipefail
+          ./build/tests 2>&1 | tee artifacts/c-tests.log
+      - name: Run standalone libunit tests with stack roots disabled
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1
+          LSAN_OPTIONS: use_stacks=0
+        run: |
+          set -euo pipefail
+          ./build/unit_close_test 2>&1 | tee artifacts/unit-close.log
+          ./build/unit_port_recv_test 2>&1 | tee artifacts/unit-port-recv.log
+          ./build/unit_msg_test 2>&1 | tee artifacts/unit-msg.log
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: php-logging-sanitizer-${{ matrix.cc }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 7
+
+  clang-ast:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
+    container:
+      image: debian:testing
+      options: --privileged
+    steps:
+      - name: Install tools inside Docker
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          printf 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-ci-bounds
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates build-essential which \
+            llvm-dev libclang-dev clang libssl-dev libpcre2-dev python3-dev pkg-config php-dev libphp-embed php-cli
+      - uses: actions/checkout@v7
+        with:
+          repository: ndj888/unit
+          ref: 6aea3c20b4d26bb4791cbd341047cdb3a677395d
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert exact source and build public clang-ast plugin
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD
+          {
+            git log -1 --format=fuller
+            clang --version
+            printf 'AST coverage: C core, PHP and Python modules; no otel or njs.\n'
+          } 2>&1 | tee artifacts/provenance.log
+          git clone --depth 1 -b unit https://github.com/freeunitorg/clang-ast.git /tmp/clang-ast
+          git -C /tmp/clang-ast rev-parse HEAD | tee artifacts/plugin-sha.log
+          make -j4 -C /tmp/clang-ast 2>&1 | tee artifacts/plugin-build.log
+      - name: Compile and run C suite under clang-ast
+        run: |
+          set -euo pipefail
+          ./configure --cc=clang \
+            --cc-opt='-Xclang -load -Xclang /tmp/clang-ast/ngx-ast.so -Xclang -add-plugin -Xclang ngx-ast -Wno-default-const-init-field-unsafe' \
+            --openssl --debug --tests 2>&1 | tee artifacts/configure.log
+          make -j4 2>&1 | tee artifacts/build.log
+          make -j4 build/lib/libunit.a tests 2>&1 | tee artifacts/build-tests.log
+          .github/scripts/check-test-hooks.sh 2>&1 | tee artifacts/test-hooks.log
+          ./build/tests 2>&1 | tee artifacts/c-tests.log
+          ./build/unit_close_test 2>&1 | tee artifacts/unit-close.log
+          ./build/unit_port_recv_test 2>&1 | tee artifacts/unit-port-recv.log
+          ./build/unit_msg_test 2>&1 | tee artifacts/unit-msg.log
+          ./configure python --config=python3-config 2>&1 | tee artifacts/configure-python.log
+          make -j4 python3 2>&1 | tee artifacts/build-python.log
+          mapfile -t php_libraries < <(find /usr/lib -name libphp.so \( -type f -o -type l \))
+          test "${#php_libraries[@]}" -eq 1
+          test -f "${php_libraries[0]}"
+          php_lib_dir="$(readlink -f "$(dirname "${php_libraries[0]}")")"
+          ./configure php --module=php --config=php-config "--lib-path=$php_lib_dir" \
+            2>&1 | tee artifacts/configure-php.log
+          make -j4 php 2>&1 | tee artifacts/build-php.log
+          test -s build/lib/unit/modules/php.unit.so
+          test -s build/lib/unit/modules/python3.unit.so
+          php --version | tee artifacts/php-version.log
+          printf 'clang-ast C core and PHP/Python module check passed.\n' | tee artifacts/result.log
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: php-logging-clang-ast
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 7
+
+
+  php-latest:
+    name: PHP 8.5 runtime
+    runs-on: ubuntu-26.04
+    timeout-minutes: 35
+    container:
+      image: debian:trixie
+      options: --privileged
+    steps:
+      - name: Install build and test dependencies
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          printf 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";\n' > /etc/apt/apt.conf.d/80-ci-bounds
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates build-essential which \
+            libssl-dev openssl libpcre2-dev zlib1g-dev libzstd-dev libbrotli-dev \
+            python3-dev python3-pytest python3-openssl python3-packaging python3-zstandard python3-brotli \
+            procps iproute2 curl pkg-config
+      - uses: actions/checkout@v7
+        with:
+          repository: ndj888/unit
+          ref: 6aea3c20b4d26bb4791cbd341047cdb3a677395d
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Assert exact source and PHP 8.5 coverage
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD
+          {
+            git log -1 --format=fuller
+            gcc --version
+            python3 --version
+            printf 'Coverage: explicit PHP 8.5 CLI/dev/embed from one source, full PHP application/targets/script-open and all 26 request-target regressions.\n'
+          } 2>&1 | tee artifacts/provenance.log
+      - name: Install and prove a coherent PHP 8.5 CLI/dev/embed toolchain
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # Reuse the packaging path already maintained and tested by this source tree.
+          . ./pkg/deb/sury-setup.sh
+          setup_sury_if_needed '8.5'
+          apt_retry apt-get install -y --no-install-recommends \
+            php8.5-cli php8.5-dev libphp8.5-embed
+          {
+            php8.5 --version
+            php-config8.5 --version
+            apt-cache policy php8.5-cli php8.5-dev libphp8.5-embed
+            dpkg-query -W -f='${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\n' \
+              php8.5-cli php8.5-dev libphp8.5-embed
+          } 2>&1 | tee -a artifacts/provenance.log
+          php8.5 -r 'if (PHP_VERSION_ID < 80500 || PHP_VERSION_ID >= 80600) { fwrite(STDERR, "PHP 8.5 is required for this coverage\n"); exit(1); } foreach (["filter_input", "session_start", "hash", "json_encode", "opcache_is_script_cached"] as $fn) { if (!function_exists($fn)) { fwrite(STDERR, "Missing required PHP function: $fn\n"); exit(1); } }'
+          test "$(php-config8.5 --version)" = "$(php8.5 -r 'echo PHP_VERSION;')"
+          python3 - <<'PYTHON'
+          import subprocess
+          packages = ('php8.5-cli', 'php8.5-dev', 'libphp8.5-embed')
+          records = []
+          for package in packages:
+              record = subprocess.check_output([
+                  'dpkg-query', '-W', '-f=${Version}\t${source:Package}\t${source:Version}', package,
+              ], text=True).strip().split('\t')
+              assert len(record) == 3 and record[1] == 'php8.5', (package, record)
+              records.append(tuple(record))
+          assert len(set(records)) == 1, f'PHP CLI/dev/embed packages must share binary and source versions: {records}'
+          print(f'Coherent PHP 8.5 binary/source package identity: {records[0]}')
+          PYTHON
+          # Enumerate only the selected embed package. Debian/Sury may use a
+          # versioned library name; give Unit its expected -lphp link explicitly.
+          mapfile -t php_libraries < <(
+            dpkg-query -L libphp8.5-embed \
+              | grep -E '/libphp(8\.5)?\.so(\.[0-9]+)*$' \
+              | while IFS= read -r library; do
+                  if [ -f "$library" ]; then readlink -f "$library"; fi
+                done \
+              | sort -u
+          )
+          test "${#php_libraries[@]}" -eq 1
+          test -s "${php_libraries[0]}"
+          printf '%s\n' "${php_libraries[0]}" | tee artifacts/php85-library-path
+          install -d /opt/php85-embed
+          ln -s "${php_libraries[0]}" /opt/php85-embed/libphp.so
+      - name: Build strict core and real PHP/Python modules
+        run: |
+          set -euo pipefail
+          ./configure --openssl --tests --hardening=strict --debug --zlib --zstd --brotli \
+            2>&1 | tee artifacts/configure.log
+          grep -q 'hardening: .* strict$' artifacts/configure.log
+          make -j4 2>&1 | tee artifacts/build.log
+          make -j4 build/lib/libunit.a tests 2>&1 | tee artifacts/build-tests.log
+          ./configure python --config=python3-config 2>&1 | tee artifacts/configure-python.log
+          make -j4 python3 2>&1 | tee artifacts/build-python.log
+          ./configure php --module=php --config=php-config8.5 --lib-path=/opt/php85-embed \
+            2>&1 | tee artifacts/configure-php.log
+          make -j4 php 2>&1 | tee artifacts/build-php.log
+          test -s build/lib/unit/modules/php.unit.so
+          test -s build/lib/unit/modules/python3.unit.so
+          ldd build/lib/unit/modules/php.unit.so 2>&1 | tee artifacts/php-module-linkage.log
+          linked_php=$(awk '$1 ~ /^libphp(8\.5)?\.so/ && $2 == "=>" {print $3}' artifacts/php-module-linkage.log)
+          test -n "$linked_php"
+          test "$(readlink -f "$linked_php")" = "$(cat artifacts/php85-library-path)"
+      - name: Run PHP application/targets, OPcache paths and all request-target cases
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          pytest-3 --print-log -ra --port 18080 \
+            --junitxml=artifacts/php-latest.xml \
+            test/test_php_application.py test/test_php_targets.py test/test_php_script_open.py \
+            test/test_php_server_variables.py \
+            test/test_http_request_target.py 2>&1 | tee artifacts/php-latest.log
+          python3 - <<'PYTHON'
+          from collections import Counter
+          import xml.etree.ElementTree as ET
+
+          cases = ET.parse('artifacts/php-latest.xml').getroot().findall('.//testcase')
+          def file_cases(stem):
+              return [c for c in cases if c.attrib.get('classname', '').split('.')[-1] == stem]
+          def name(case):
+              return case.attrib['name'].split('[', 1)[0]
+          def ok(case):
+              return all(case.find(k) is None for k in ('failure', 'error', 'skipped'))
+          def require_pass(group, label):
+              assert group, f'{label}: no cases collected'
+              for case in group:
+                  assert ok(case), f'{label}: {ET.tostring(case, encoding="unicode")}'
+
+          sockets = file_cases('test_http_request_target')
+          expected = {
+              'test_http_request_target_raw_space': 16,
+              'test_http_request_target_control_character': 7,
+              'test_http_request_target_encoded_space_keepalive': 2,
+              'test_http_request_target_encoded_control_and_utf8': 1,
+          }
+          assert Counter(map(name, sockets)) == expected, Counter(map(name, sockets))
+          require_pass(sockets, 'all 26 request-target cases')
+          php = file_cases('test_php_application')
+          rewritten = [c for c in php if name(c).startswith('test_php_application_rewritten_path_')]
+          assert len(rewritten) >= 33, f'expected at least 33 rewritten-path cases, got {len(rewritten)}'
+          require_pass(rewritten, 'fork rewritten-path coverage')
+          for suffix in ('verbatim', 'normalized', 'filter_input', 'rewrite', 'worker_reuse'):
+              required = 'test_php_application_rewritten_path_' + suffix
+              require_pass([c for c in rewritten if name(c) == required], required)
+          targets = file_cases('test_php_targets')
+          require_pass(targets, 'PHP targets')
+          server_variables = file_cases('test_php_server_variables')
+          assert len(server_variables) == 3, f'expected 3 PHP server-variable cases, got {len(server_variables)}'
+          require_pass(server_variables, 'PHP server variables')
+          script_open = file_cases('test_php_script_open')
+          # The fixtures assert X-OPcache=1 in the actual Unit worker, not the CLI.
+          # Do not force unrelated platform/debug/optional cases to run.
+          opcache = ('test_php_script_open_static_script_opcache',
+                     'test_php_script_open_static_script_opcache_miss',
+                     'test_php_script_open_static_script_opcache_no_open')
+          for required in opcache:
+              require_pass([c for c in script_open if name(c) == required], required)
+          print(f'PHP: {len(rewritten)} rewritten-path, {len(targets)} targets; required OPcache hit/miss cases passed.')
+          print(f'HTTP: all {len(sockets)} socket cases passed, including raw controls and encoded/UTF-8 cases.')
+          print(f'Suite: {sum(map(ok, cases))} passed; {sum(c.find("skipped") is not None for c in cases)} skipped.')
+          PYTHON
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: php-logging-php-latest
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 7
